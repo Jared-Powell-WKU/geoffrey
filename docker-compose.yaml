@@ -1,0 +1,62 @@
+# Production stack for the bot. Deployed to /opt/stacks/discord-bot/compose.yaml
+# and started through /opt/stacks/bin/deploy, which supplies IMAGE_TAG.
+# See deploy/README.md.
+#
+# The project name, the `db` volume and the `mariadb` service name are fixed:
+# together they resolve to the existing volume discord-bot_db and the container
+# discord-bot-mariadb-1 that the nightly backup cron uses.
+name: discord-bot
+
+services:
+  mariadb:
+    image: ${MARIADB_IMAGE:-mariadb:12.1}
+    restart: unless-stopped
+    env_file: mariadb.env
+    command: ["mariadbd", "--key-buffer-size=8M", "--innodb-buffer-pool-size=64M"]
+    volumes:
+      - db:/var/lib/mysql
+      # Only read when the data volume is empty, i.e. a rebuild from nothing.
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 60s
+    networks:
+      - geoffrey
+
+  geoffrey:
+    image: ${GEOFFREY_IMAGE:-ghcr.io/jared-powell-wku/discord-bot}:${IMAGE_TAG:?IMAGE_TAG is not set. Use /opt/stacks/bin/deploy rather than docker compose directly}
+    restart: unless-stopped
+    init: true
+    env_file: geoffrey.env
+    environment:
+      DB_HOST: mariadb
+    depends_on:
+      mariadb:
+        condition: service_healthy
+    healthcheck:
+      # src/util/health.ts rewrites this file every 30 s while the Discord gateway is connected.
+      test: ["CMD", "node", "-e", "const t=Number(require('fs').readFileSync(process.env.HEALTH_FILE||'/tmp/geoffrey-health','utf8'));process.exit(Date.now()-t<90000?0:1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    networks:
+      geoffrey:
+      # Private service-to-service network shared with cantus.dev. The database
+      # is deliberately not on it.
+      internal:
+        aliases:
+          - geoffrey-api
+
+networks:
+  geoffrey:
+    driver: bridge
+  internal:
+    name: cantus-internal
+    external: true
+
+volumes:
+  db:

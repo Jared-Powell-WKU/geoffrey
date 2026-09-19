@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Runs on the droplet, in the stack directory, before containers are replaced.
+# 1. Takes and verifies a database dump. 2. Applies pending schema migrations.
+# A non-zero exit aborts the deploy with the running containers untouched.
+#
+# MariaDB DDL is not transactional, so a migration that fails half way is not
+# rolled back. The dump taken here is the recovery point; migrations are
+# written to be re-runnable for the same reason.
+set -euo pipefail
+
+DB_CONTAINER="${DB_CONTAINER:-discord-bot-mariadb-1}"
+STACK_DIR="${STACK_DIR:-$PWD}"
+BACKUP_DIR="$STACK_DIR/backups"
+KEEP_DUMPS=10
+MIN_DUMP_BYTES="${MIN_DUMP_BYTES:-50000}"
+
+say() { echo "[pre-deploy] $*"; }
+
+if ! docker ps --format '{{.Names}}' | grep -qx "$DB_CONTAINER"; then
+  say "$DB_CONTAINER is not running (first deploy on this host); nothing to back up or migrate"
+  exit 0
+fi
+
+# The root password is read from the database container's own environment, so
+# no credential is stored in this script or passed on a host command line.
+db() { docker exec -i "$DB_CONTAINER" sh -c 'exec mariadb -uroot -p"$MARIADB_ROOT_PASSWORD" --batch --skip-column-names "$MARIADB_DATABASE"'; }
+
+umask 077
+mkdir -p "$BACKUP_DIR"
+dump="$BACKUP_DIR/pre-deploy-$(date -u +%Y%m%dT%H%M%SZ)-${IMAGE_TAG:-manual}.sql.gz"
+say "dumping to $dump"
+docker exec "$DB_CONTAINER" sh -c 'exec mariadb-dump -uroot -p"$MARIADB_ROOT_PASSWORD" --single-transaction --routines "$MARIADB_DATABASE"' | gzip > "$dump.tmp"
+gzip -t "$dump.tmp"
+zcat "$dump.tmp" | tail -1 | grep -q "Dump completed" || { say "dump is incomplete"; rm -f "$dump.tmp"; exit 1; }
+[ "$(stat -c %s "$dump.tmp")" -ge "$MIN_DUMP_BYTES" ] || { say "dump is suspiciously small"; rm -f "$dump.tmp"; exit 1; }
+mv "$dump.tmp" "$dump"
+ls -1t "$BACKUP_DIR"/pre-deploy-*.sql.gz | tail -n +$((KEEP_DUMPS + 1)) | xargs -r rm -f --
+
+echo "CREATE TABLE IF NOT EXISTS schema_migrations (name VARCHAR(255) NOT NULL PRIMARY KEY, appliedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP)" | db
+
+shopt -s nullglob
+applied_any=0
+for file in "$STACK_DIR"/migrations/[0-9][0-9][0-9]_*.sql; do
+  name="$(basename "$file")"
+  [[ "$name" =~ ^[0-9]{3}_[a-z0-9_]+\.sql$ ]] || { say "refusing oddly named migration: $name"; exit 1; }
+  if [ "$(echo "SELECT COUNT(*) FROM schema_migrations WHERE name = '$name'" | db)" != "0" ]; then continue; fi
+  say "applying $name"
+  db < "$file"
+  echo "INSERT INTO schema_migrations (name) VALUES ('$name')" | db
+  applied_any=1
+done
+[ "$applied_any" = 1 ] && say "migrations applied" || say "schema is up to date"

@@ -1,0 +1,7 @@
+# Files that run on Linux must keep LF endings even when edited on Windows.
+*.sh text eol=lf
+*.sql text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+Dockerfile* text eol=lf
+deploy/pre-deploy text eol=lf

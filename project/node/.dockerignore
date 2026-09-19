@@ -1,0 +1,9 @@
+node_modules
+dist
+npm-debug.log*
+# Secrets never enter an image or a build context.
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*

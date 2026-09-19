@@ -1,0 +1,14 @@
+project/node/src/.env
+project/node/dist/
+project/node/src/package.json
+node_modules/
+build/
+.vscode/
+project/node_modules/
+dump.*
+project/mariadb/sql/
+project/node/src/util/secrets.js
+test.js
+.env
+docker-compose.override.yaml
+sql_backups/

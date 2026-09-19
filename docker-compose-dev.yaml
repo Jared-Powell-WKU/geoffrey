@@ -1,0 +1,42 @@
+# Local development. Run `docker network create cantus-internal` once first;
+# it is the same shared network the production stacks use, so a local
+# cantus.dev can reach this bot at http://geoffrey-api:8787.
+services:
+  mariadb:
+    build:
+      context: ./project/mariadb/
+    restart: unless-stopped
+    environment:
+      # From the root .env file, which git ignores. Use the same value as
+      # DB_PASSWORD in project/node/src/.env. It only takes effect when the db
+      # volume is first created.
+      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD:?Set MARIADB_ROOT_PASSWORD in a .env file next to this compose file}
+    networks:
+      - geoffrey
+    ports:
+      - 127.0.0.1:3306:3306
+    volumes:
+      - db:/var/lib/mysql
+  geoffrey:
+    build:
+      context: ./project/node/
+      dockerfile: Dockerfile_dev
+    restart: unless-stopped
+    networks:
+      geoffrey:
+      internal:
+        aliases:
+          - geoffrey-api
+    volumes:
+      - ./project/node/src:/app/src/
+      # dotenv reads /app/dist/.env; the file is mounted, never built into the image.
+      - ./project/node/src/.env:/app/dist/.env:ro
+    command: ["npm", "run", "dev"]
+networks:
+  geoffrey:
+    driver: bridge
+  internal:
+    name: cantus-internal
+    external: true
+volumes:
+  db:

@@ -1,0 +1,40 @@
+{
+  "name": "discord-bot",
+  "version": "1.0.0",
+  "description": "Cantus's Discord Bot",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "test": "tsc && node --test \"dist/test/**/*.test.js\"",
+    "dev": "nodemon --legacy-watch /app/dist/index.js",
+    "start": "node /app/index.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Jared-Powell-WKU/Discord-Bot.git"
+  },
+  "author": "Jared Powell",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/Jared-Powell-WKU/Discord-Bot/issues"
+  },
+  "homepage": "https://github.com/Jared-Powell-WKU/Discord-Bot#readme",
+  "dependencies": {
+    "chromedriver": "^137.0.3",
+    "discord.js": "^14.22.1",
+    "dotenv": "^16.0.3",
+    "graphql-request": "^5.1.0",
+    "mariadb": "^3.1.1",
+    "node-fetch": "^3.3.2",
+    "selenium-webdriver": "^4.33.0",
+    "twitter-api-sdk": "^1.2.1"
+  },
+  "devDependencies": {
+    "@types/chromedriver": "^81.0.5",
+    "@types/node": "^22.10.5",
+    "@types/selenium-webdriver": "^4.1.28",
+    "nodemon": "^3.1.9",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.3"
+  }
+}
