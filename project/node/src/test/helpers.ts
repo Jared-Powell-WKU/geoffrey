@@ -31,7 +31,6 @@ export interface FakeRow {
 // BigInt where the real driver does.
 export class FakeDb {
     tables: Record<string, FakeRow[]> = {homies: [], pets: []};
-    archive: (FakeRow & {category: string, reason: string})[] = [];
     statements: {sql: string, params: unknown[]}[] = [];
     transactions: string[] = [];
     nextId = 1n;
@@ -97,18 +96,12 @@ export class FakeDb {
         if((m = /^SELECT channelId, messageId FROM (\w+) WHERE id = CAST\(\? AS UNSIGNED\) AND guildId = \? AND userId = \?$/.exec(sql))) {
             return this.table(m[1]).filter(r => r.id === BigInt(params[0] as string) && r.guildId === params[1] && r.userId === params[2]).map(r => ({channelId: r.channelId, messageId: r.messageId}));
         }
-        // archiveAndDelete, as the API's DELETE route calls it.
-        const owned = "t.id = CAST(? AS UNSIGNED) AND t.guildId = ? AND t.userId = ?";
-        if((m = /^INSERT INTO submissions_archive \(category, id, url, guildId, userId, createdAt, source, channelId, messageId, reason\) SELECT \?, t\.id, t\.url, t\.guildId, t\.userId, t\.createdAt, t\.source, t\.channelId, t\.messageId, \? FROM (\w+) t WHERE (.*)$/.exec(sql)) && m[2] === owned) {
-            const [category, reason, id, guildId, userId] = params as string[];
-            const matches = this.table(m[1]).filter(r => r.id === BigInt(id) && r.guildId === guildId && r.userId === userId);
-            this.archive.push(...matches.map(r => ({...r, category, reason})));
-            return {affectedRows: matches.length, insertId: 0n};
-        }
-        if((m = /^DELETE t FROM (\w+) t STRAIGHT_JOIN submissions_archive a ON a\.category = \? AND a\.id = t\.id AND a\.reason = \? WHERE (.*)$/.exec(sql)) && m[2] === owned) {
-            const [category, reason, id, guildId, userId] = params as string[];
+        // removeRows for a removal the user asked for, as the API's DELETE route
+        // calls it: a plain delete. Anything touching the archive is "Unexpected SQL".
+        if((m = /^DELETE t FROM (\w+) t WHERE t\.id = CAST\(\? AS UNSIGNED\) AND t\.guildId = \? AND t\.userId = \?$/.exec(sql))) {
+            const [id, guildId, userId] = params as string[];
             const rows = this.table(m[1]);
-            const kept = rows.filter(r => !(r.id === BigInt(id) && r.guildId === guildId && r.userId === userId && this.archive.some(a => a.category === category && a.reason === reason && a.id === r.id)));
+            const kept = rows.filter(r => !(r.id === BigInt(id) && r.guildId === guildId && r.userId === userId));
             this.tables[m[1]] = kept;
             return {affectedRows: rows.length - kept.length, insertId: 0n};
         }
@@ -118,15 +111,14 @@ export class FakeDb {
     // One "connection": the statements run through the same fake, and a
     // failure puts the tables back the way a rollback would.
     transaction = async <T>(work: (query: QueryFn) => Promise<T>): Promise<T> => {
-        const before = {tables: {homies: [...this.tables.homies], pets: [...this.tables.pets]}, archive: [...this.archive]};
+        const before = {homies: [...this.tables.homies], pets: [...this.tables.pets]};
         this.transactions.push("begin");
         try {
             const result = await work(this.query);
             this.transactions.push("commit");
             return result;
         } catch(e) {
-            this.tables = before.tables;
-            this.archive = before.archive;
+            this.tables = before;
             this.transactions.push("rollback");
             throw e;
         }

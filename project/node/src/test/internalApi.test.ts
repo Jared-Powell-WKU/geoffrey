@@ -403,13 +403,15 @@ describe("deleting", () => {
         assert.equal(h.discord.reactionsRemoved.length, 1);
         assert.equal(h.db.tables.homies.length, 0);
         assert.equal((await h.request("DELETE", `/v1/guilds/${GUILD}/submissions/homies/${web.id}?userId=${USER}`)).status, 404);
-        // Nothing is hard-deleted: each row went to the archive, inside a transaction.
-        assert.deepEqual(h.db.archive.map(a => [a.category, a.id, a.url, a.reason]), [first, second, web].map(r => ["homies", r.id, r.url, "removed_on_site"]));
+        // The user asked for it, so the row is erased: a plain delete in a transaction, and no archive copy.
         assert.deepEqual(h.db.transactions, ["begin", "commit", "begin", "commit", "begin", "commit", "begin", "commit"]);
-        assert.ok(!h.db.statements.some(s => /^DELETE FROM/.test(s.sql)), "a plain DELETE would bypass the archive");
+        const writes = h.db.statements.filter(s => !s.sql.startsWith("SELECT"));
+        assert.deepEqual(writes.map(s => s.sql), new Array(4).fill("DELETE t FROM homies t WHERE t.id = CAST(? AS UNSIGNED) AND t.guildId = ? AND t.userId = ?"));
+        assert.deepEqual(writes[0].params, [String(first.id), GUILD, USER]);
+        assert.ok(!h.db.statements.some(s => /submissions_archive/i.test(s.sql)));
     });
 
-    test("a delete that cannot be archived deletes nothing", async () => {
+    test("a delete that fails is rolled back and reported, and the camera stays", async () => {
         const row = h.db.add("homies", {url: "https://example.com/1.png", channelId: "300", messageId: "400"});
         const real = h.db.query;
         h.db.query = async (sql: string, params: unknown[] = []) => {
@@ -421,7 +423,6 @@ describe("deleting", () => {
             const res = await failing.request("DELETE", `/v1/guilds/${GUILD}/submissions/homies/${row.id}?userId=${USER}`);
             assert.equal(res.status, 500);
             assert.equal(h.db.tables.homies.length, 1);
-            assert.equal(h.db.archive.length, 0);
             assert.equal(h.db.transactions.join(), "begin,rollback");
             assert.equal(failing.discord.reactionsRemoved.length, 0);
         } finally {

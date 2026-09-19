@@ -6,13 +6,15 @@
 // bot token, not the gateway, so it can run while the bot is online. Nothing in
 // the bot imports this file.
 //
-// A row is only ever archived on positive evidence: the refreshed CDN URL
+// This is the bot's own judgment, so unlike a removal a person asked for, the
+// row is copied to the archive before it is deleted (the policy is in
+// util/imageRemoval.ts). A row is only ever archived on positive evidence: the refreshed CDN URL
 // answers 404 AND the channel's messages around the attachment id come back
 // (HTTP 200) without that attachment. Anything else - other statuses, missing
 // access, rate limits, network trouble - leaves the row alone.
 import * as mariadb from "mariadb";
 import { REST, Routes } from "discord.js";
-import { archiveAndDelete, parseDiscordAttachmentUrl } from "../util/imageRemoval";
+import { removeRows, parseDiscordAttachmentUrl } from "../util/imageRemoval";
 import { createDbAccess } from "../util/dbAccess";
 import { getTableByCommandName } from "../util/tables";
 
@@ -220,7 +222,7 @@ async function main(): Promise<number> {
                     return {status: Number(e?.status) || 0, messages: []};
                 }
             },
-            archive: (row) => transaction((inTransaction) => archiveAndDelete(inTransaction, row.category, "gone_from_discord", "t.id = CAST(? AS UNSIGNED) AND t.url = ?", [row.id, row.url])),
+            archive: (row) => transaction((inTransaction) => removeRows(inTransaction, row.category, "gone_from_discord", "t.id = CAST(? AS UNSIGNED) AND t.url = ?", [row.id, row.url])),
             sleep,
             log: (line) => console.info(line)
         }, options);

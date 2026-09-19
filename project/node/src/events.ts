@@ -56,31 +56,32 @@ export const saveAttachmentsFromMessage = async function(message: Message) {
 }
 
 // Deletions
-// A submission whose Discord message is gone 404s on the site and in rolls, so
-// its rows are archived. With partials on, an uncached message arrives with
+// A submission whose Discord message is gone 404s on the site and in rolls, and
+// whoever deleted the message meant it, so its rows are deleted outright.
+// With partials on, an uncached message arrives with
 // only its ids, which is enough for rows that recorded a messageId; a cached
 // one also brings its attachments, which finds rows from before messageId existed.
-const archiveDeletedMessages = async (guildId: string|null, messages: (Message|PartialMessage)[]) => {
+const deleteSubmissionsOfMessages = async (guildId: string|null, messages: (Message|PartialMessage)[]) => {
     try {
         if(!guildId || !messages.length) return;
         const activeGuild = Object.values(guilds).filter((g)=>{return g.guildId === guildId})[0];
         if(!activeGuild) return;
         // proxyURL too: a few old rows were stored with the media.discordapp.net form.
         const attachmentUrls = messages.flatMap(message => [...(message.attachments?.values() ?? [])]).flatMap(attachment => [attachment.url, attachment.proxyURL]);
-        const archived = await deleteImagesForMessages(guildId, messages.map(message => message.id), attachmentUrls, "message_deleted");
-        if(archived) console.info(`Archived ${archived} stored submission(s) of ${messages.length} deleted message(s) in guild ${guildId}.`);
+        const deleted = await deleteImagesForMessages(guildId, messages.map(message => message.id), attachmentUrls, "message_deleted");
+        if(deleted) console.info(`Deleted ${deleted} stored submission(s) of ${messages.length} deleted message(s) in guild ${guildId}.`);
     } catch(e) {
-        console.error(`Unable to archive the submissions of ${messages.length} deleted message(s) in guild ${guildId}.`, e);
+        console.error(`Unable to delete the submissions of ${messages.length} deleted message(s) in guild ${guildId}.`, e);
     }
 }
 
-export const archiveSubmissionsOfDeletedMessage = async (message: Message|PartialMessage) => {
-    await archiveDeletedMessages(message.guildId, [message]);
+export const deleteSubmissionsOfDeletedMessage = async (message: Message|PartialMessage) => {
+    await deleteSubmissionsOfMessages(message.guildId, [message]);
 }
 
-export const archiveSubmissionsOfDeletedMessages = async (messages: ReadonlyCollection<string, Message|PartialMessage>) => {
+export const deleteSubmissionsOfDeletedMessages = async (messages: ReadonlyCollection<string, Message|PartialMessage>) => {
     const all = [...messages.values()];
-    await archiveDeletedMessages(all[0]?.guildId ?? null, all);
+    await deleteSubmissionsOfMessages(all[0]?.guildId ?? null, all);
 }
 
 // Pins

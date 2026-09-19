@@ -3,7 +3,8 @@
 # tables (not defaults/, which already has the final shape) and checks that no
 # data is lost and the deployed bot's SQL keeps working: first 001 and 002 on
 # the original shape, then 003 on that result with duplicates of every kind
-# seen in production. Then runs the internal
+# seen in production, then 004 on an archive that holds rows of every reason.
+# Then runs the internal
 # API's integration test against the same database when it has been compiled
 # (cd project/node && npm test).
 #
@@ -180,10 +181,7 @@ TOTAL_BEFORE="$(wc -l < "$WORK/before003" | tr -d ' ')"
 echo "  $TOTAL_BEFORE rows before 003"
 
 echo "Applying 003"
-for f in "$HERE"/migrations/00[3-9]_*.sql "$HERE"/migrations/0[1-9][0-9]_*.sql; do
-    [ -f "$f" ] || continue
-    apply "$f" && pass "applied $(basename "$f")" || fail "applying $(basename "$f")"
-done
+apply "$HERE/migrations/003_dedupe_media.sql" && pass "applied 003_dedupe_media.sql" || fail "applying 003_dedupe_media.sql"
 for t in homies pets; do
     check "$t has exactly one row per (guildId, mediaKey)" "$(q "SELECT COUNT(*) FROM (SELECT 1 FROM $t GROUP BY guildId, mediaKey HAVING COUNT(*) > 1) d")" "0"
     check "$t has the unique key (guildId, mediaKey)" "$(q "SELECT CONCAT(GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX), ' ', MAX(NON_UNIQUE)) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = 'tncord' AND TABLE_NAME = '$t' AND INDEX_NAME = '${t}_media_UK'")" "guildId,mediaKey 0"
@@ -206,6 +204,35 @@ if q "INSERT INTO homies (url, guildId, userId) VALUES ('$A/1400000000000000001/
 q "INSERT INTO homies (url, guildId, userId, channelId, messageId, createdAt) VALUES ('$A/1400000000000000001/a.png?ex=69000000&is=68ff0000&hm=123&', '$G3', 'u9', '7', 'again', '2025-01-01 00:00:00'), ('$A/1400000000000000099/new.png', '$G3', 'u9', '7', 'fresh', '2025-01-01 00:00:00') ON DUPLICATE KEY UPDATE userId = userId" && pass "the new saveAttachments statement accepts a batch that contains a second copy" || fail "new saveAttachments statement"
 check "...storing only what is new and leaving the stored copy untouched" "$(q "SELECT GROUP_CONCAT(CONCAT(messageId, ':', userId) ORDER BY id SEPARATOR ' ') FROM homies WHERE guildId = '$G3' AND mediaKey IN ('discord:700000000000000009/1400000000000000001', 'discord:700000000000000009/1400000000000000099')")" "keep-A:u1 fresh:u9"
 q "DELETE FROM homies WHERE messageId = 'fresh'"
+
+echo "An archive as production has it before 004"
+# Removals people asked for were archived for a short time; 004 erases those and
+# must leave the bot's own judgments (duplicate, gone_from_discord) exactly as they are.
+sql tncord <<SQL
+INSERT INTO submissions_archive (category, id, url, guildId, userId, createdAt, source, channelId, messageId, reason, archivedAt) VALUES
+('homies', 900001, 'https://example.com/person-1.png', '$G3', 'u1', '2025-02-02 02:02:02', 'web', NULL, NULL, 'removed_on_site', '2025-09-01 10:00:00'),
+('homies', 900002, '$A/1400000000000000031/person-2.png$NEW', '$G3', 'u1', '2025-02-02 02:02:02', 'discord', '700000000000000009', '1400000000000000032', 'removed_by_reaction', '2025-09-01 10:00:01'),
+('pets', 900003, '$A/1400000000000000033/person-3.png', '$G3', NULL, NULL, 'discord', '700000000000000009', '1400000000000000034', 'message_deleted', '2025-09-01 10:00:02'),
+('pets', 900004, '$A/1400000000000000035/swept.png$OLD', '$G3', 'u2', '2025-02-02 02:02:02', 'discord', '700000000000000009', '1400000000000000036', 'gone_from_discord', '2025-09-01 10:00:03'),
+('homies', 900005, '$M/1400000000000000037/swept.png', '$G4', NULL, NULL, 'discord', NULL, NULL, 'gone_from_discord', '2025-09-01 10:00:04');
+SQL
+ARCHIVECOLS="archiveId, category, id, HEX(url), guildId, IFNULL(userId, '<NULL>'), IFNULL(createdAt, '<NULL>'), source, IFNULL(channelId, '<NULL>'), IFNULL(messageId, '<NULL>'), reason, reason + 0, IFNULL(keptId, '<NULL>'), archivedAt"
+check "the archive holds rows of all five reasons" "$(q "SELECT GROUP_CONCAT(CONCAT(reason, ':', n) ORDER BY reason + 0) FROM (SELECT reason, COUNT(*) AS n FROM submissions_archive GROUP BY reason) r")" "duplicate:12,gone_from_discord:2,message_deleted:1,removed_by_reaction:1,removed_on_site:1"
+q "SELECT $ARCHIVECOLS FROM submissions_archive WHERE reason IN ('duplicate', 'gone_from_discord') ORDER BY archiveId" > "$WORK/kept004"
+allrows > "$WORK/live-before004"
+
+echo "Applying 004"
+for f in "$HERE"/migrations/00[4-9]_*.sql "$HERE"/migrations/0[1-9][0-9]_*.sql; do
+    [ -f "$f" ] || continue
+    apply "$f" && pass "applied $(basename "$f")" || fail "applying $(basename "$f")"
+done
+q "SELECT $ARCHIVECOLS FROM submissions_archive ORDER BY archiveId" > "$WORK/after004"
+if diff -q "$WORK/kept004" "$WORK/after004" >/dev/null; then pass "the person-initiated rows are gone; the 12 duplicate and 2 gone_from_discord rows are byte-identical"; else fail "004 changed the wrong rows"; diff "$WORK/kept004" "$WORK/after004" | head -10; fi
+check "14 archive rows remain" "$(wc -l < "$WORK/after004" | tr -d ' ')" "14"
+check "the reason ENUM is narrowed" "$(q "SELECT CONCAT(COLUMN_TYPE, ' ', IS_NULLABLE) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = 'tncord' AND TABLE_NAME = 'submissions_archive' AND COLUMN_NAME = 'reason'")" "enum('duplicate','gone_from_discord') NO"
+allrows > "$WORK/live-after004"
+if diff -q "$WORK/live-before004" "$WORK/live-after004" >/dev/null; then pass "004 does not touch homies or pets"; else fail "004 changed live rows"; fi
+if q "INSERT INTO submissions_archive (category, id, url, guildId, reason) VALUES ('homies', 900009, 'https://example.com/x.png', '$G3', 'removed_on_site')" 2>/dev/null; then fail "a person-initiated reason can still be archived"; else pass "a person-initiated reason can no longer be archived"; fi
 
 echo "Re-running every migration"
 everything > "$WORK/first"
@@ -238,7 +265,7 @@ else
     if (cd "$HERE/../node" && TEST_DB_HOST=127.0.0.1 TEST_DB_PORT="$PORT" TEST_DB_USER=root TEST_DB_PASSWORD="$PW" TEST_DB_NAME=tncord timeout 120 node --test dist/test/integration.test.js) > "$WORK/api" 2>&1; then
         # A skipped suite also exits 0, so insist that tests really ran.
         RAN="$(grep -Eo 'pass [0-9]+' "$WORK/api" | tr -dc '0-9')"; SKIPPED="$(grep -Eo 'skipped [0-9]+' "$WORK/api" | tr -dc '0-9')"
-        if [ "${RAN:-0}" -ge 10 ] && [ "${SKIPPED:-1}" = 0 ]; then pass "API integration test ($RAN passed, $SKIPPED skipped)"; else fail "API integration test did not run"; cat "$WORK/api"; fi
+        if [ "${RAN:-0}" -ge 11 ] && [ "${SKIPPED:-1}" = 0 ]; then pass "API integration test ($RAN passed, $SKIPPED skipped)"; else fail "API integration test did not run"; cat "$WORK/api"; fi
     else
         fail "API integration test"; cat "$WORK/api"
     fi

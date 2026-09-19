@@ -12,4 +12,5 @@ COLLATE=utf8mb4_general_ci;
 INSERT INTO tncord.schema_migrations (`name`) VALUES
 	('001_submission_columns.sql'),
 	('002_backfill_created_at.sql'),
-	('003_dedupe_media.sql');
+	('003_dedupe_media.sql'),
+	('004_erase_person_removals.sql');

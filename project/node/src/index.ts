@@ -2,7 +2,7 @@ require('dotenv').config();
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { Collection, Client, Events, GatewayIntentBits, Partials, PartialUser, User, MessageReaction, PartialMessageReaction } from 'discord.js'
-import { interactionHandler, saveAttachmentsFromMessage, checkPinLimit, checkForImageDeletion, archiveSubmissionsOfDeletedMessage, archiveSubmissionsOfDeletedMessages } from './events';
+import { interactionHandler, saveAttachmentsFromMessage, checkPinLimit, checkForImageDeletion, deleteSubmissionsOfDeletedMessage, deleteSubmissionsOfDeletedMessages } from './events';
 import { DiscordCommand } from './util/commandHelper';
 import { checkEvPortStatus } from './util/checkEvPortStatus';
 import { GuildDictionary, query, transaction } from './util/util';
@@ -46,8 +46,8 @@ startInternalApi({client, query, transaction});
 
 client.on(Events.InteractionCreate, interactionHandler);
 client.on(Events.MessageCreate, saveAttachmentsFromMessage);
-client.on(Events.MessageDelete, archiveSubmissionsOfDeletedMessage);
-client.on(Events.MessageBulkDelete, archiveSubmissionsOfDeletedMessages);
+client.on(Events.MessageDelete, deleteSubmissionsOfDeletedMessage);
+client.on(Events.MessageBulkDelete, deleteSubmissionsOfDeletedMessages);
 client.on(Events.MessageReactionAdd, async(reaction: MessageReaction|PartialMessageReaction, user: User|PartialUser)=>{return await checkForImageDeletion(reaction, user, client)})
 
 let portsAvailable: boolean = false;

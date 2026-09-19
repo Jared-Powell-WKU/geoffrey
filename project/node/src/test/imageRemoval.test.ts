@@ -2,7 +2,7 @@ import { test, describe } from "node:test";
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { archiveAndDelete, mediaKey, parseDiscordAttachmentUrl, QueryFn, removeImageByUrl, removeImagesForMessages, TransactionFn } from "../util/imageRemoval";
+import { ErasedReason, isArchivedReason, mediaKey, parseDiscordAttachmentUrl, QueryFn, removalSql, removeImageByUrl, removeImagesForMessages, removeRows, TransactionFn } from "../util/imageRemoval";
 import { insertAttachmentsSql } from "../util/submissionSql";
 import { MEDIA_KEY_CASES, OWN_KEY_CASES } from "./helpers";
 
@@ -42,34 +42,50 @@ function recorder(affectedRows: (sql: string) => number = () => 0) {
 }
 
 const COPY = "INSERT INTO submissions_archive (category, id, url, guildId, userId, createdAt, source, channelId, messageId, reason) SELECT ?, t.id, t.url, t.guildId, t.userId, t.createdAt, t.source, t.channelId, t.messageId, ? FROM";
-const REMOVE = (table: string) => `DELETE t FROM ${table} t STRAIGHT_JOIN submissions_archive a ON a.category = ? AND a.id = t.id AND a.reason = ? WHERE`;
+const REMOVE_ARCHIVED = (table: string) => `DELETE t FROM ${table} t STRAIGHT_JOIN submissions_archive a ON a.category = ? AND a.id = t.id AND a.reason = ? WHERE`;
+const ERASED: ErasedReason[] = ["message_deleted", "removed_by_reaction", "removed_on_site"];
 
-describe("archive-then-delete", () => {
-    test("copies first, then deletes only what is in the archive, with the same predicate and parameters", async () => {
-        const {statements, query} = recorder(() => 2);
-        assert.equal(await archiveAndDelete(query, "pets", "message_deleted", "t.guildId = ? AND t.messageId IN (?,?)", ["G", "M1", "M2"]), 2);
+describe("the removal policy", () => {
+    test("only the bot's own judgment is archived; what a person asked for is not", () => {
+        assert.equal(isArchivedReason("gone_from_discord"), true);
+        for(const reason of ERASED) assert.equal(isArchivedReason(reason), false, reason);
+    });
+
+    test("a removal a person asked for is one plain delete that never names the archive", async () => {
+        for(const reason of ERASED) {
+            const {statements, query} = recorder(() => 2);
+            assert.equal(await removeRows(query, "pets", reason, "t.guildId = ? AND t.messageId IN (?,?)", ["G", "M1", "M2"]), 2);
+            assert.deepEqual(statements, [{sql: "DELETE t FROM pets t WHERE t.guildId = ? AND t.messageId IN (?,?)", params: ["G", "M1", "M2"]}], reason);
+            assert.deepEqual(removalSql("pets", reason, "t.id = ?"), {copy: null, remove: "DELETE t FROM pets t WHERE t.id = ?"});
+        }
+    });
+
+    test("the bot's own judgment copies first, then deletes only what is in the archive, with the same predicate and parameters", async () => {
+        const {statements, query} = recorder(() => 1);
+        assert.equal(await removeRows(query, "pets", "gone_from_discord", "t.id = CAST(? AS UNSIGNED) AND t.url = ?", ["7", "https://x.y/z"]), 1);
         assert.deepEqual(statements, [
-            {sql: `${COPY} pets t WHERE t.guildId = ? AND t.messageId IN (?,?)`, params: ["pets", "message_deleted", "G", "M1", "M2"]},
-            {sql: `${REMOVE("pets")} t.guildId = ? AND t.messageId IN (?,?)`, params: ["pets", "message_deleted", "G", "M1", "M2"]}
+            {sql: `${COPY} pets t WHERE t.id = CAST(? AS UNSIGNED) AND t.url = ?`, params: ["pets", "gone_from_discord", "7", "https://x.y/z"]},
+            {sql: `${REMOVE_ARCHIVED("pets")} t.id = CAST(? AS UNSIGNED) AND t.url = ?`, params: ["pets", "gone_from_discord", "7", "https://x.y/z"]}
         ]);
     });
 
     test("a mismatch between copied and deleted rows is an error, so the transaction rolls back", async () => {
         const {query} = recorder(sql => sql.startsWith("INSERT") ? 2 : 1);
-        await assert.rejects(archiveAndDelete(query, "homies", "removed_on_site", "t.id = ?", ["1"]), /rolling back/);
+        await assert.rejects(removeRows(query, "homies", "gone_from_discord", "t.id = ?", ["1"]), /rolling back/);
     });
+});
 
+describe("removals people ask for", () => {
     test("a roll is removed by mediaKey from both tables in one transaction", async () => {
-        const {log, statements, transaction} = recorder(sql => sql.includes("pets") && sql.startsWith("DELETE") || sql.includes("pets t") && sql.startsWith("INSERT") ? 1 : 0);
+        const {log, statements, transaction} = recorder(sql => sql.includes("pets") ? 1 : 0);
         const removed = await removeImageByUrl(transaction, "https://cdn.discordapp.com/attachments/12/34/a.png?ex=1&is=2&hm=3&", "G", "removed_by_reaction");
         assert.equal(removed, 1);
         assert.deepEqual(log, ["begin", "commit"]);
-        assert.deepEqual(statements.map(s => s.params), new Array(4).fill(0).map((_, i) => [i < 2 ? "homies" : "pets", "removed_by_reaction", "G", "discord:12/34"]));
-        assert.ok(statements.every(s => s.sql.endsWith("WHERE t.guildId = ? AND t.mediaKey = ?")));
+        assert.deepEqual(statements, ["homies", "pets"].map(table => ({sql: `DELETE t FROM ${table} t WHERE t.guildId = ? AND t.mediaKey = ?`, params: ["G", "discord:12/34"]})));
         // Elsewhere the query string is part of the identity.
         const other = recorder();
         await removeImageByUrl(other.transaction, "https://example.com/i.php?id=1", "G", "removed_by_reaction");
-        assert.equal(other.statements[0].params[3], "https://example.com/i.php?id=1");
+        assert.equal(other.statements[0].params[1], "https://example.com/i.php?id=1");
     });
 
     test("messages are removed by id, then legacy rows by the attachments' mediaKeys", async () => {
@@ -82,18 +98,16 @@ describe("archive-then-delete", () => {
         ], "message_deleted");
         assert.equal(removed, 0);
         assert.deepEqual(log, ["begin", "commit"]);
-        const wheres = statements.filter(s => s.sql.startsWith("INSERT")).map(s => [s.sql.split(" FROM ")[1], s.params.slice(2)]);
-        assert.deepEqual(wheres, ["homies", "pets"].flatMap(table => [
-            [`${table} t WHERE t.guildId = ? AND t.messageId IN (?,?)`, ["G", "M1", "M2"]],
-            [`${table} t WHERE t.guildId = ? AND t.messageId IS NULL AND t.mediaKey IN (?,?)`, ["G", "discord:12/34", "discord:12/35"]]
+        assert.deepEqual(statements, ["homies", "pets"].flatMap(table => [
+            {sql: `DELETE t FROM ${table} t WHERE t.guildId = ? AND t.messageId IN (?,?)`, params: ["G", "M1", "M2"]},
+            {sql: `DELETE t FROM ${table} t WHERE t.guildId = ? AND t.messageId IS NULL AND t.mediaKey IN (?,?)`, params: ["G", "discord:12/34", "discord:12/35"]}
         ]));
-        assert.equal(statements.length, 8);
     });
 
     test("an uncached deleted message needs no attachments, and a database error rolls back and propagates", async () => {
         const plain = recorder();
         await removeImagesForMessages(plain.transaction, "G", ["M"], [], "message_deleted");
-        assert.equal(plain.statements.length, 4);
+        assert.equal(plain.statements.length, 2);
         const failing = recorder();
         const broken: TransactionFn = (work) => failing.transaction(() => work(async () => { throw new Error("down"); }));
         await assert.rejects(removeImagesForMessages(broken, "G", ["M"], [], "message_deleted"), /down/);
@@ -103,7 +117,14 @@ describe("archive-then-delete", () => {
     test("more than 100 deleted messages are split into several IN lists", async () => {
         const {statements, transaction} = recorder();
         await removeImagesForMessages(transaction, "G", new Array(150).fill(0).map((_, i) => `M${i}`), [], "message_deleted");
-        assert.deepEqual(statements.filter(s => s.sql.startsWith("INSERT") && s.sql.includes("homies")).map(s => s.params.length - 3), [100, 50]);
+        assert.deepEqual(statements.filter(s => s.sql.includes("homies")).map(s => s.params.length - 1), [100, 50]);
+    });
+
+    test("none of them ever names the archive", async () => {
+        const {statements, transaction} = recorder();
+        await removeImageByUrl(transaction, "https://cdn.discordapp.com/attachments/12/34/a.png", "G", "removed_by_reaction");
+        await removeImagesForMessages(transaction, "G", ["M"], ["https://cdn.discordapp.com/attachments/12/34/a.png"], "message_deleted");
+        assert.ok(statements.length > 0 && !statements.some(s => /submissions_archive|INSERT/i.test(s.sql)));
     });
 });
 
@@ -115,9 +136,9 @@ describe("saving attachments", () => {
 });
 
 describe("the archive stays out of sight", () => {
-    // Rolls (getPhotoFromTable), /stats and /leaderboard, the API's listing: none
-    // of them may ever read submissions_archive. Only the code that writes to it
-    // may name it.
+    // Rolls (getPhotoFromTable), /stats and /leaderboard, the API's listing and
+    // its DELETE: none of them may ever touch submissions_archive. Only the one
+    // module that holds the removal policy may name it.
     test("no compiled file but the removal code mentions submissions_archive", () => {
         const dist = path.join(__dirname, "..");
         const mentions: string[] = [];

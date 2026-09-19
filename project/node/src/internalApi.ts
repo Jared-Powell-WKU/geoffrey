@@ -5,7 +5,7 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { Client, Routes } from "discord.js";
 import { getTableByCommandName } from "./util/tables";
 import { formatWebAddNotice } from "./util/storedUrl";
-import { archiveAndDelete, QueryFn, TransactionFn } from "./util/imageRemoval";
+import { removeRows, QueryFn, TransactionFn } from "./util/imageRemoval";
 // Type-only: importing util.ts for real would open the database pool.
 import type { GuildDictionary, SupportedGuild } from "./util/util";
 
@@ -379,8 +379,8 @@ export function createInternalApi(deps: InternalApiDeps): http.Server {
         const table = tableFor(category);
         const owned = [rawId, guildId, userId];
         const existing: any[] = await query(`SELECT channelId, messageId FROM ${table} WHERE id = CAST(? AS UNSIGNED) AND guildId = ? AND userId = ?`, owned);
-        // Nothing is hard-deleted: the row moves to the archive.
-        const removed = await transaction((inTransaction) => archiveAndDelete(inTransaction, table, "removed_on_site", "t.id = CAST(? AS UNSIGNED) AND t.guildId = ? AND t.userId = ?", owned));
+        // DELETE erases the row: a removal the user asked for keeps no copy anywhere.
+        const removed = await transaction((inTransaction) => removeRows(inTransaction, table, "removed_on_site", "t.id = CAST(? AS UNSIGNED) AND t.guildId = ? AND t.userId = ?", owned));
         if(!removed) throw notFound("No such submission.");
 
         const channelId = existing?.[0]?.channelId;

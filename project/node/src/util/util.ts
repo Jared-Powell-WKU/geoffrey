@@ -2,7 +2,7 @@ import * as mariadb from "mariadb";
 import * as dotenv from "dotenv";
 import { Attachment, Client, Collection, User } from "discord.js";
 import { getTableByCommandName } from "./tables";
-import { RemovalReason, removeImageByUrl, removeImagesForMessages } from "./imageRemoval";
+import { ErasedReason, removeImageByUrl, removeImagesForMessages } from "./imageRemoval";
 import { insertAttachmentsSql } from "./submissionSql";
 import { createDbAccess } from "./dbAccess";
 dotenv.config();
@@ -132,7 +132,7 @@ export async function saveAttachments(attachments: Collection<string, Attachment
     }
 }
 
-export async function deleteImage(url:string, guildId:string, reason: RemovalReason): Promise<boolean> {
+export async function deleteImage(url:string, guildId:string, reason: ErasedReason): Promise<boolean> {
     try {
         return await removeImageByUrl(transaction, url, guildId, reason) > 0;
     } catch(e) {
@@ -143,7 +143,7 @@ export async function deleteImage(url:string, guildId:string, reason: RemovalRea
 
 // Rejects when the database could not be asked, so the caller can tell
 // "nothing is stored for these messages" (0) from "unknown".
-export async function deleteImagesForMessages(guildId: string, messageIds: string[], attachmentUrls: string[], reason: RemovalReason): Promise<number> {
+export async function deleteImagesForMessages(guildId: string, messageIds: string[], attachmentUrls: string[], reason: ErasedReason): Promise<number> {
     return await removeImagesForMessages(transaction, guildId, messageIds, attachmentUrls, reason);
 }
 

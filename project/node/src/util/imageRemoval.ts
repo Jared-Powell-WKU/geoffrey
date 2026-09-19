@@ -1,7 +1,6 @@
-// Removal of stored images. Nothing is hard-deleted: a row leaves homies or
-// pets only in the same transaction that copies it into submissions_archive.
-// Free of side effects (database access is passed in) so it can be tested
-// against a real database without the bot's pool.
+// Removal of stored images: one code path, removeRows, for every way a row
+// leaves homies or pets. Free of side effects (database access is passed in)
+// so it can be tested against a real database without the bot's pool.
 import { getTableByCommandName } from "./tables";
 
 export type QueryFn = (sql: string, params?: unknown[]) => Promise<any>;
@@ -9,8 +8,23 @@ export type QueryFn = (sql: string, params?: unknown[]) => Promise<any>;
 // resolves, roll back when it rejects.
 export type TransactionFn = <T>(work: (query: QueryFn) => Promise<T>) => Promise<T>;
 
-// The values of submissions_archive.reason the bot writes ('duplicate' belongs to migration 003).
-export type RemovalReason = "gone_from_discord" | "message_deleted" | "removed_by_reaction" | "removed_on_site";
+// THE POLICY, and the only place it lives.
+// A removal a person asked for is a real delete with no copy kept: taking an
+// image down on the site, the author's or a mod's cross, the five-vote purge,
+// a mod's bomb, deleting the Discord message. They meant it.
+// A removal that is the bot's own judgment is archived first, in the same
+// transaction, because the bot can be wrong and the row must be reviewable and
+// restorable: the sweep deciding an attachment is gone from Discord, and
+// migration 003 deciding a row is a duplicate ('duplicate' is written only there).
+export type ErasedReason = "message_deleted" | "removed_by_reaction" | "removed_on_site";
+export type ArchivedReason = "gone_from_discord";
+export type RemovalReason = ErasedReason | ArchivedReason;
+
+const ARCHIVED_REASONS: readonly string[] = ["gone_from_discord"] satisfies ArchivedReason[];
+
+export function isArchivedReason(reason: RemovalReason): reason is ArchivedReason {
+    return ARCHIVED_REASONS.includes(reason);
+}
 
 const DISCORD_ATTACHMENT = /^https:\/\/(?:cdn\.discordapp\.com|media\.discordapp\.net)\/attachments\/([0-9]+)\/([0-9]+)\//;
 // MessageBulkDelete carries at most 100 messages; this also bounds the IN lists.
@@ -39,21 +53,29 @@ export function mediaKey(url: string): string {
 
 const ARCHIVE_COLUMNS = ["id", "url", "guildId", "userId", "createdAt", "source", "channelId", "messageId"];
 
-// The two statements of an archive-then-delete; both take [table, reason, ...params of where].
-// The delete can only hit rows that are in the archive. STRAIGHT_JOIN makes it
-// start from the few rows `where` selects instead of walking the archive.
-export function archiveAndDeleteSql(table: string, where: string): {copy: string, remove: string} {
+// The statements that remove the rows matching `where` (written against the alias t).
+// Erased: one plain delete, taking the params of where.
+// Archived: a copy into submissions_archive, then a delete that can only hit rows
+// that are in the archive; both take [table, reason, ...params of where].
+// STRAIGHT_JOIN makes that delete start from the few rows `where` selects
+// instead of walking the archive.
+export function removalSql(table: string, reason: RemovalReason, where: string): {copy: string|null, remove: string} {
+    if(!isArchivedReason(reason)) return {copy: null, remove: `DELETE t FROM ${table} t WHERE ${where}`};
     return {
         copy: `INSERT INTO submissions_archive (category, ${ARCHIVE_COLUMNS.join(", ")}, reason) SELECT ?, ${ARCHIVE_COLUMNS.map(column => `t.${column}`).join(", ")}, ? FROM ${table} t WHERE ${where}`,
         remove: `DELETE t FROM ${table} t STRAIGHT_JOIN submissions_archive a ON a.category = ? AND a.id = t.id AND a.reason = ? WHERE ${where}`
     };
 }
 
-// Copies the rows matching `where` (written against the alias t) into
-// submissions_archive and then deletes exactly the rows that were copied. Must
-// be given the query function of an open transaction. Returns the row count.
-export async function archiveAndDelete(query: QueryFn, table: string, reason: RemovalReason, where: string, params: unknown[]): Promise<number> {
-    const sql = archiveAndDeleteSql(table, where);
+// Removes the rows matching `where` the way the policy above says for that
+// reason: deleted outright, or copied to the archive and then deleted. Must be
+// given the query function of an open transaction. Returns the row count.
+export async function removeRows(query: QueryFn, table: string, reason: RemovalReason, where: string, params: unknown[]): Promise<number> {
+    const sql = removalSql(table, reason, where);
+    if(sql.copy === null) {
+        const deleted = await query(sql.remove, params);
+        return Number(deleted?.affectedRows ?? 0);
+    }
     const archived = await query(sql.copy, [table, reason, ...params]);
     const deleted = await query(sql.remove, [table, reason, ...params]);
     const count = Number(deleted?.affectedRows ?? 0);
@@ -68,11 +90,11 @@ function placeholders(values: unknown[]): string {
 }
 
 // Removes the image a bot-authored message (a roll or a web-add notice) shows.
-export async function removeImageByUrl(transaction: TransactionFn, url: string, guildId: string, reason: RemovalReason): Promise<number> {
+export async function removeImageByUrl(transaction: TransactionFn, url: string, guildId: string, reason: ErasedReason): Promise<number> {
     return await transaction(async (query) => {
         let removed = 0;
         for(const table of submissionTables()) {
-            removed += await archiveAndDelete(query, table, reason, "t.guildId = ? AND t.mediaKey = ?", [guildId, mediaKey(url)]);
+            removed += await removeRows(query, table, reason, "t.guildId = ? AND t.mediaKey = ?", [guildId, mediaKey(url)]);
         }
         return removed;
     });
@@ -83,18 +105,18 @@ export async function removeImageByUrl(transaction: TransactionFn, url: string, 
 // the attachments the messages are known to carry. Pass every URL form of each
 // attachment (url and proxyURL). Resolving with 0 means nothing is stored for
 // those messages; a database error rejects.
-export async function removeImagesForMessages(transaction: TransactionFn, guildId: string, messageIds: string[], attachmentUrls: string[], reason: RemovalReason): Promise<number> {
+export async function removeImagesForMessages(transaction: TransactionFn, guildId: string, messageIds: string[], attachmentUrls: string[], reason: ErasedReason): Promise<number> {
     const keys = [...new Set(attachmentUrls.filter(url => !!url).map(mediaKey))];
     return await transaction(async (query) => {
         let removed = 0;
         for(const table of submissionTables()) {
             for(let i = 0; i < messageIds.length; i += CHUNK) {
                 const chunk = messageIds.slice(i, i + CHUNK);
-                removed += await archiveAndDelete(query, table, reason, `t.guildId = ? AND t.messageId IN (${placeholders(chunk)})`, [guildId, ...chunk]);
+                removed += await removeRows(query, table, reason, `t.guildId = ? AND t.messageId IN (${placeholders(chunk)})`, [guildId, ...chunk]);
             }
             for(let i = 0; i < keys.length; i += CHUNK) {
                 const chunk = keys.slice(i, i + CHUNK);
-                removed += await archiveAndDelete(query, table, reason, `t.guildId = ? AND t.messageId IS NULL AND t.mediaKey IN (${placeholders(chunk)})`, [guildId, ...chunk]);
+                removed += await removeRows(query, table, reason, `t.guildId = ? AND t.messageId IS NULL AND t.mediaKey IN (${placeholders(chunk)})`, [guildId, ...chunk]);
             }
         }
         return removed;

@@ -5,7 +5,7 @@ import * as assert from "node:assert/strict";
 import * as http from "node:http";
 import * as mariadb from "mariadb";
 import { createInternalApi } from "../internalApi";
-import { archiveAndDelete, archiveAndDeleteSql, mediaKey, QueryFn, removeImageByUrl, removeImagesForMessages, TransactionFn } from "../util/imageRemoval";
+import { mediaKey, QueryFn, removalSql, removeImageByUrl, removeImagesForMessages, removeRows, TransactionFn } from "../util/imageRemoval";
 import { createDbAccess } from "../util/dbAccess";
 import { insertAttachmentsSql } from "../util/submissionSql";
 import { FakeDiscord, GUILDS, GUILD, KEY, listen, makeRequester, MEDIA_KEY_CASES, OTHER_USER, OWN_KEY_CASES, USER } from "./helpers";
@@ -28,7 +28,7 @@ describe("internal API against MariaDB", {skip: TEST_DB_PORT ? false : "TEST_DB_
     before(async () => {
         pool = mariadb.createPool({host: TEST_DB_HOST || "127.0.0.1", port: Number(TEST_DB_PORT), user: TEST_DB_USER || "root", password: TEST_DB_PASSWORD, database: TEST_DB_NAME || "tncord", connectionLimit: 2});
         db = createDbAccess(pool);
-        for(const table of ["homies", "pets"]) await query(`DELETE FROM ${table} WHERE guildId = ?`, [GUILD]);
+        for(const table of ["homies", "pets", "submissions_archive"]) await query(`DELETE FROM ${table} WHERE guildId = ?`, [GUILD]);
         // What the updated saveAttachments sends, two attachments on one message.
         await query("INSERT INTO homies (url, guildId, userId, channelId, messageId, createdAt) VALUES (?,?,?,?,?,?), (?,?,?,?,?,?)", [
             "https://cdn.discordapp.com/attachments/300000000000000001/1100000000000000001/one.png?ex=66f00000&is=66eeae80&hm=abc&", GUILD, USER, "300000000000000001", "400000000000000001", "2024-06-01 12:00:00",
@@ -116,9 +116,8 @@ describe("internal API against MariaDB", {skip: TEST_DB_PORT ? false : "TEST_DB_
         assert.deepEqual(discord.reactionsRemoved, [{channelId: "300000000000000001", messageId: "400000000000000001"}]);
         assert.equal((await query("SELECT COUNT(*) AS n FROM homies WHERE guildId = ? AND messageId = ?", [GUILD, "400000000000000001"]))[0].n, 0n);
         assert.equal((await request("DELETE", `/v1/guilds/${GUILD}/submissions/homies/${message[1].id}?userId=${USER}`)).status, 404);
-        // Removed on the site means archived, not gone.
-        const archived: any[] = await query("SELECT CAST(id AS CHAR) AS id, reason, userId, messageId FROM submissions_archive WHERE category = 'homies' AND id IN (?,?) ORDER BY id", [message[0].id, message[1].id]);
-        assert.deepEqual(archived.map(a => ({...a})), message.map(m => ({id: m.id, reason: "removed_on_site", userId: USER, messageId: "400000000000000001"})));
+        // Removed on the site means erased: no copy is kept anywhere.
+        assert.equal((await query("SELECT COUNT(*) AS n FROM submissions_archive WHERE guildId = ?", [GUILD]))[0].n, 0n);
     });
 
     test("the same Discord attachment under another signature or host is 409", async () => {
@@ -135,7 +134,7 @@ describe("internal API against MariaDB", {skip: TEST_DB_PORT ? false : "TEST_DB_
         await query("DELETE FROM pets WHERE guildId = ?", [GUILDS.clantus.guildId]);
     });
 
-    describe("media identity, archive-then-delete and removal", () => {
+    describe("media identity and removal", () => {
         const RG = "100000000000000777";
         const ELSEWHERE = "100000000000000778";
         const FILLER = "100000000000000779";
@@ -181,7 +180,7 @@ describe("internal API against MariaDB", {skip: TEST_DB_PORT ? false : "TEST_DB_
             await query("DELETE FROM homies WHERE guildId = ?", [RG]);
         });
 
-        test("archive-then-delete keeps an exact copy, and leaves no copy behind when the delete fails", async () => {
+        test("the bot's own judgment (the sweep) is archived as an exact copy, and leaves no copy behind when the delete fails", async () => {
             const url = `${cdn}1100000000000000201/tx.png?ex=66f00000&is=66eeae80&hm=aaa&`;
             await add("pets", url, RG, "400000000000000201");
             const [original]: any[] = await query(`SELECT ${COLUMNS} FROM pets WHERE guildId = ?`, [RG]);
@@ -190,17 +189,39 @@ describe("internal API against MariaDB", {skip: TEST_DB_PORT ? false : "TEST_DB_
                 if(sql.startsWith("DELETE")) throw new Error("the delete failed");
                 return inTransaction(sql, params);
             }));
-            await assert.rejects(failingDelete((q) => archiveAndDelete(q, "pets", "message_deleted", "t.guildId = ?", [RG])), /the delete failed/);
+            await assert.rejects(failingDelete((q) => removeRows(q, "pets", "gone_from_discord", "t.guildId = ?", [RG])), /the delete failed/);
             assert.deepEqual(await archivedFor(), []);
             assert.deepEqual(await live(), [url]);
 
-            assert.equal(await transaction((q) => archiveAndDelete(q, "pets", "message_deleted", "t.guildId = ?", [RG])), 1);
+            assert.equal(await transaction((q) => removeRows(q, "pets", "gone_from_discord", "t.guildId = ?", [RG])), 1);
             assert.deepEqual(await live(), []);
-            assert.deepEqual(await archivedFor(), [{category: "pets", reason: "message_deleted", ...original}]);
+            assert.deepEqual(await archivedFor(), [{category: "pets", reason: "gone_from_discord", ...original}]);
             const [meta]: any[] = await query("SELECT keptId, TIMESTAMPDIFF(SECOND, archivedAt, CURRENT_TIMESTAMP) AS age FROM submissions_archive WHERE guildId = ?", [RG]);
             assert.equal(meta.keptId, null);
             assert.ok(Number(meta.age) >= 0 && Number(meta.age) < 60);
-            assert.equal(await transaction((q) => archiveAndDelete(q, "pets", "message_deleted", "t.guildId = ?", [RG])), 0);
+            assert.equal(await transaction((q) => removeRows(q, "pets", "gone_from_discord", "t.guildId = ?", [RG])), 0);
+            await query("DELETE FROM submissions_archive WHERE guildId = ?", [RG]);
+        });
+
+        test("a removal a person asked for erases the row and keeps no copy, in one transaction", async () => {
+            await add("homies", `${cdn}1100000000000000211/h.png`, RG, "400000000000000211");
+            await add("pets", `${cdn}1100000000000000212/p.png`, RG, "400000000000000211");
+            for(const reason of ["message_deleted", "removed_by_reaction", "removed_on_site"] as const) {
+                await add("pets", `${cdn}1100000000000000213/${reason}.png`, ELSEWHERE, "400000000000000213");
+                assert.equal(await transaction((q) => removeRows(q, "pets", reason, "t.guildId = ? AND t.messageId = ?", [ELSEWHERE, "400000000000000213"])), 1, reason);
+            }
+            assert.deepEqual(await live(ELSEWHERE), []);
+
+            // The pets delete fails after the homies delete succeeded: the whole removal must be undone.
+            const failingOnPets: TransactionFn = (work) => transaction((inTransaction) => work(async (sql, params) => {
+                if(sql.startsWith("DELETE t FROM pets")) throw new Error("the delete failed");
+                return inTransaction(sql, params);
+            }));
+            await assert.rejects(removeImagesForMessages(failingOnPets, RG, ["400000000000000211"], [], "message_deleted"), /the delete failed/);
+            assert.equal((await live()).length, 2);
+            assert.equal(await removeImagesForMessages(transaction, RG, ["400000000000000211"], [], "message_deleted"), 2);
+            assert.deepEqual(await live(), []);
+            assert.deepEqual([...(await archivedFor()), ...(await archivedFor(ELSEWHERE))], []);
         });
 
         test("a deleted message takes its rows with it: by messageId, and legacy rows by mediaKey", async () => {
@@ -241,9 +262,8 @@ describe("internal API against MariaDB", {skip: TEST_DB_PORT ? false : "TEST_DB_
 
             assert.deepEqual(await live(), [...survivors].sort());
             assert.deepEqual((await live(ELSEWHERE)).length, 3);
-            assert.deepEqual(await archivedFor(ELSEWHERE), []);
-            const gone = (await archivedFor()).filter(a => a.reason === "message_deleted" && a.messageId !== "400000000000000201");
-            assert.deepEqual(gone.map(a => a.url).sort(), [signed, unsigned, media, `${cdn}1100000000000000310/new-a.png?ex=66f00000&is=66eeae80&hm=aaa&`, `${cdn}1100000000000000311/new-b.png?ex=66f00000&is=66eeae80&hm=aaa&`, `${cdn}1100000000000000312/new-c.png`].sort());
+            // Six rows are gone for good: nothing about them was archived.
+            assert.deepEqual([...(await archivedFor()), ...(await archivedFor(ELSEWHERE))], []);
             // Asked again, nothing is left to match: the "stale camera" case of the reaction path.
             assert.equal(await removeImagesForMessages(transaction, RG, ["400000000000000300"], [unsigned], "removed_by_reaction"), 0);
         });
@@ -262,20 +282,27 @@ describe("internal API against MariaDB", {skip: TEST_DB_PORT ? false : "TEST_DB_
             assert.equal(await removeImageByUrl(transaction, stored, RG, "removed_by_reaction"), 0);
             assert.ok((await live()).includes("https://example.com/i.php?id=2"));
             assert.ok((await live(ELSEWHERE)).includes(stored));
-            assert.deepEqual((await archivedFor()).filter(a => a.reason === "removed_by_reaction").map(a => a.url).sort(), [stored, "https://example.com/i.php?id=1"].sort());
+            assert.deepEqual(await archivedFor(), []);
         });
 
         test("removal looks rows up through the mediaKey and messageId indexes, not by scanning", async () => {
             await query("INSERT INTO homies (url, guildId, userId, messageId) SELECT CONCAT(?, 1200000000000000000 + seq, '/filler_', seq, '.png', IF(seq % 2, '?ex=66f00000&is=66eeae80&hm=abc&', '')), ?, ?, IF(seq % 3, 1300000000000000000 + seq, NULL) FROM seq_1_to_4000", [cdn, FILLER, USER]);
             try {
                 await query("ANALYZE TABLE homies");
-                const plan = async (where: string, params: unknown[]) => (await query(`EXPLAIN ${archiveAndDeleteSql("homies", where).remove}`, ["homies", "message_deleted", ...params]) as any[]).find(step => step.table === "t");
+                const plan = async (where: string, params: unknown[]) => (await query(`EXPLAIN ${removalSql("homies", "message_deleted", where).remove}`, params) as any[]).find(step => step.table === "t" || step.table === "homies");
                 const byKey = await plan("t.guildId = ? AND t.messageId IS NULL AND t.mediaKey IN (?,?)", [FILLER, "discord:300000000000000009/1200000000000000003", "discord:300000000000000009/1200000000000000006"]);
                 assert.equal(byKey.key, "homies_media_UK", `${byKey.type} on ${byKey.key}, ${byKey.rows} rows`);
                 assert.ok(Number(byKey.rows) <= 4);
                 const byMessage = await plan("t.guildId = ? AND t.messageId IN (?,?)", [FILLER, "1300000000000000001", "1300000000000000002"]);
                 assert.equal(byMessage.key, "homies_message_IDX", `${byMessage.type} on ${byMessage.key}, ${byMessage.rows} rows`);
                 assert.ok(Number(byMessage.rows) <= 4);
+                // The sweep's archived removal starts from the row, not from the archive.
+                const [filler]: any[] = await query("SELECT CAST(id AS CHAR) AS id, url FROM homies WHERE guildId = ? LIMIT 1", [FILLER]);
+                // An id is a unique key, so the optimizer reads that one row while planning
+                // ("const tables") or plans a keyed lookup of it; either way nothing is scanned.
+                const swept: any[] = await query(`EXPLAIN ${removalSql("homies", "gone_from_discord", "t.id = CAST(? AS UNSIGNED) AND t.url = ?").remove}`, ["homies", "gone_from_discord", filler.id, filler.url]);
+                const sweptRow = swept.find(step => step.table === "t");
+                assert.ok(sweptRow ? ["homies_id_UK", "PRIMARY"].includes(sweptRow.key) && Number(sweptRow.rows) <= 1 : /const tables/.test(String(swept[0]?.Extra)), JSON.stringify(swept, (_k, v) => typeof v === "bigint" ? Number(v) : v));
                 assert.equal(await removeImagesForMessages(transaction, FILLER, ["1300000000000000001"], [`${cdn}1200000000000000003/filler_3.png?ex=1&is=2&hm=3&`], "message_deleted"), 2);
                 assert.equal((await query("SELECT COUNT(*) AS n FROM homies WHERE guildId = ?", [FILLER]))[0].n, 3998n);
             } finally {
