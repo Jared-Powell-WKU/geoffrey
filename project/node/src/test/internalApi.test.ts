@@ -521,10 +521,10 @@ describe("pool", () => {
         ]);
         assert.equal(res.body.total, 2);
         assert.equal(res.body.nextCursor, null);
-        assert.deepEqual(res.body.poster, {name: "other", avatarUrl: null, key: keyFor(OTHER_USER)});
+        assert.deepEqual(res.body.posters, [{name: "other", avatarUrl: null, key: keyFor(OTHER_USER)}]);
         // The statements are scoped to that member, and only the viewer's own rights are marked.
         for(const {sql, params} of h.db.statements.filter(s => !s.sql.startsWith("SELECT DISTINCT"))) {
-            assert.match(sql, / FROM homies WHERE guildId = \? AND userId = \?/);
+            assert.match(sql, / FROM homies WHERE guildId = \? AND userId IN \(\?\)/);
             assert.equal(params[1], OTHER_USER);
         }
         assert.ok(!JSON.stringify(res.body).includes(OTHER_USER));
@@ -532,8 +532,45 @@ describe("pool", () => {
         assert.deepEqual((await h.request("GET", pool(`userId=${USER}&category=pets&poster=${keyFor(OTHER_USER)}`))).body.items.map((i: any) => i.url), ["https://example.com/their-pet.png"]);
         assert.deepEqual((await h.request("GET", pool(`userId=${OTHER_USER}&category=homies&poster=${keyFor(OTHER_USER)}`))).body.items.map((i: any) => [i.mine, i.canDelete]), [[true, true], [true, true]]);
         assert.deepEqual((await h.request("GET", pool(`userId=${MOD_USER}&category=homies&poster=${keyFor(OTHER_USER)}`))).body.items.map((i: any) => [i.mine, i.canDelete]), [[false, true], [false, true]]);
-        // Without the filter the answer has no poster field at all.
-        assert.ok(!("poster" in (await h.request("GET", pool(`userId=${USER}&category=homies`))).body));
+        // Without the filter the answer has no posters field at all.
+        assert.ok(!("posters" in (await h.request("GET", pool(`userId=${USER}&category=homies`))).body));
+    });
+
+    test("several posters at once: their rows together, in one order, counted together", async () => {
+        const rows = seed();
+        h.db.add("homies", {url: "https://example.com/theirs-2.png", userId: OTHER_USER, createdAt: "2024-05-06 10:00:00"});
+        const both = `${keyFor(OTHER_USER)},${keyFor(MOD_USER)}`;
+        const res = await h.request("GET", pool(`userId=${USER}&category=homies&poster=${both}`));
+        assert.equal(res.status, 200);
+        assert.deepEqual(res.body.items.map((i: any) => i.url), [
+            "https://example.com/theirs-2.png",
+            rows.theirs.url,
+            rows.mods.url
+        ]);
+        assert.equal(res.body.total, 3);
+        // Named in the order they were asked for, whatever order the rows came in.
+        assert.deepEqual(res.body.posters.map((p: any) => [p.name, p.key]), [
+            ["other", keyFor(OTHER_USER)],
+            ["A Mod", keyFor(MOD_USER)]
+        ]);
+        for(const {sql, params} of h.db.statements.filter(s => !s.sql.startsWith("SELECT DISTINCT"))) {
+            assert.match(sql, / FROM homies WHERE guildId = \? AND userId IN \(\?, \?\)/);
+            assert.deepEqual(params.slice(1, 3), [OTHER_USER, MOD_USER]);
+        }
+        assert.ok(!JSON.stringify(res.body).includes(OTHER_USER) && !JSON.stringify(res.body).includes(MOD_USER));
+        // A key repeated is one member; a key naming nobody drops out of both
+        // the filter and the answer, and does not make it list everyone.
+        const mixed = await h.request("GET", pool(`userId=${USER}&category=homies&poster=${keyFor(OTHER_USER)},${keyFor(STRANGER)},${keyFor(OTHER_USER)}`));
+        assert.deepEqual(mixed.body.items.map((i: any) => i.url), ["https://example.com/theirs-2.png", rows.theirs.url]);
+        assert.equal(mixed.body.total, 2);
+        assert.deepEqual(mixed.body.posters.map((p: any) => p.key), [keyFor(OTHER_USER)]);
+        // At most 25 of them, and one bad key spoils the list.
+        const keys = (count: number) => Array.from({length: count}, (_, i) => keyFor(`2000000000000001${String(i).padStart(2, "0")}`)).join(",");
+        assert.equal((await h.request("GET", pool(`userId=${USER}&category=homies&poster=${keys(25)}`))).status, 200);
+        const tooMany = await h.request("GET", pool(`userId=${USER}&category=homies&poster=${keys(26)}`));
+        assert.equal(tooMany.status, 400);
+        assert.equal(tooMany.body.error.code, "INVALID_REQUEST");
+        assert.equal((await h.request("GET", pool(`userId=${USER}&category=homies&poster=${keyFor(USER)},nope`))).status, 400);
     });
 
     test("a member with nothing in this collection is still named; a key that names nobody lists nothing and runs no listing", async () => {
@@ -541,24 +578,43 @@ describe("pool", () => {
         h.db.add("pets", {url: "https://example.com/only-a-pet.png", userId: "200000000000000007", createdAt: "2024-05-06 11:00:00"});
         h.discord.guildProfiles.set(`${GUILD}:200000000000000007`, {name: "Pet Person", avatarUrl: null});
         const empty = await h.request("GET", pool(`userId=${USER}&category=homies&poster=${keyFor("200000000000000007")}`));
-        assert.deepEqual(empty.body, {items: [], nextCursor: null, total: 0, poster: {name: "Pet Person", avatarUrl: null, key: keyFor("200000000000000007")}});
+        assert.deepEqual(empty.body, {items: [], nextCursor: null, total: 0, posters: [{name: "Pet Person", avatarUrl: null, key: keyFor("200000000000000007")}]});
 
         h.db.statements.length = 0;
         const unknown = await h.request("GET", pool(`userId=${USER}&category=homies&poster=${keyFor(STRANGER)}`));
         assert.equal(unknown.status, 200);
-        assert.deepEqual(unknown.body, {items: [], nextCursor: null, total: 0, poster: null});
+        assert.deepEqual(unknown.body, {items: [], nextCursor: null, total: 0, posters: []});
         assert.ok(h.db.statements.every(s => s.sql.startsWith("SELECT DISTINCT userId FROM ")));
         assert.equal(h.discord.posterLookups.filter(l => l.userIds.includes(STRANGER)).length, 0);
         // The same key in another guild is somebody else's, so it names nobody there either.
         h.db.add("homies", {url: "https://example.com/elsewhere-theirs.png", guildId: OTHER_GUILD, userId: OTHER_USER});
-        assert.deepEqual((await h.request("GET", pool(`userId=${USER}&category=homies&poster=${keyFor(OTHER_USER)}`, OTHER_GUILD))).body, {items: [], nextCursor: null, total: 0, poster: null});
+        assert.deepEqual((await h.request("GET", pool(`userId=${USER}&category=homies&poster=${keyFor(OTHER_USER)}`, OTHER_GUILD))).body, {items: [], nextCursor: null, total: 0, posters: []});
         assert.equal((await h.request("GET", pool(`userId=${USER}&category=homies&poster=${keyFor(OTHER_USER, OTHER_GUILD)}`, OTHER_GUILD))).body.total, 1);
+    });
+
+    test("a key made since the map was built resolves once the map is old enough to be built again", async () => {
+        seed();
+        const newcomer = "200000000000000008";
+        // The map is built, and does not know this member yet.
+        await h.request("GET", pool(`userId=${USER}&category=homies&poster=${keyFor(OTHER_USER)}`));
+        h.db.add("homies", {url: "https://example.com/newcomer.png", userId: newcomer, createdAt: "2024-05-07 10:00:00"});
+        const path = pool(`userId=${USER}&category=homies&poster=${keyFor(newcomer)}`);
+        assert.equal((await h.request("GET", path)).body.total, 0);
+        // A moment later a miss is worth the rebuild, and the key works.
+        h.clock.now += 6_000;
+        const found = await h.request("GET", path);
+        assert.equal(found.body.total, 1);
+        assert.deepEqual(found.body.items.map((i: any) => i.url), ["https://example.com/newcomer.png"]);
+        // A miss against a map just built does not scan again.
+        h.db.statements.length = 0;
+        await h.request("GET", pool(`userId=${USER}&category=homies&poster=${keyFor(STRANGER)}`));
+        assert.deepEqual(h.db.statements, []);
     });
 
     test("a malformed poster key is refused before any SQL or Discord call; the own listing ignores the parameter", async () => {
         seed();
         h.db.statements.length = 0;
-        for(const poster of ["", "abc", keyFor(USER).slice(0, 21), keyFor(USER) + "A", keyFor(USER).slice(0, 21) + "+", keyFor(USER).slice(0, 21) + "=", USER, encodeURIComponent("a b c d e f g h i j k l")]) {
+        for(const poster of ["", "abc", keyFor(USER).slice(0, 21), keyFor(USER) + "A", keyFor(USER).slice(0, 21) + "+", keyFor(USER).slice(0, 21) + "=", USER, ",", `${keyFor(USER)},`, encodeURIComponent("a b c d e f g h i j k l")]) {
             const res = await h.request("GET", pool(`userId=${USER}&category=homies&poster=${poster}`));
             assert.equal(res.status, 400, poster);
             assert.equal(res.body.error.code, "INVALID_REQUEST");
@@ -568,10 +624,78 @@ describe("pool", () => {
         // A stranger with a well-formed key is still a stranger.
         assert.equal((await h.request("GET", pool(`userId=${STRANGER}&category=homies&poster=${keyFor(USER)}`))).status, 403);
         assert.equal(h.db.statements.length, 0);
-        const own = await h.request("GET", list(`userId=${USER}&category=homies&poster=${keyFor(OTHER_USER)}`));
+        const own = await h.request("GET", list(`userId=${USER}&category=homies&poster=${keyFor(OTHER_USER)}&from=2024-05-04T00:00:00Z`));
         assert.equal(own.status, 200);
         assert.equal(own.body.total, 1);
-        assert.ok(!("poster" in own.body));
+        assert.ok(!("posters" in own.body));
+    });
+
+    test("from and until bound the pool to a stretch of time, counted the same way", async () => {
+        const rows = seed();
+        const between = (query: string) => h.request("GET", pool(`userId=${USER}&category=homies&${query}`));
+        // from is inclusive, until is exclusive, so a day is [day, next day).
+        const oneDay = await between("from=2024-05-04T00:00:00Z&until=2024-05-05T00:00:00Z");
+        assert.equal(oneDay.status, 200);
+        assert.deepEqual(oneDay.body.items.map((i: any) => i.url), [rows.theirs.url]);
+        assert.equal(oneDay.body.total, 1);
+        // A weekend, and the row with no date at all, which is in no stretch of time.
+        const weekend = await between("from=2024-05-04T00:00:00Z&until=2024-05-06T00:00:00Z");
+        assert.deepEqual(weekend.body.items.map((i: any) => i.url), [rows.mine.url, rows.theirs.url]);
+        assert.equal(weekend.body.total, 2);
+        assert.ok(!weekend.body.items.some((i: any) => i.createdAt === null));
+        // Open at either end.
+        assert.equal((await between("from=2024-05-04T00:00:00Z")).body.total, 2);
+        assert.equal((await between("until=2024-05-04T00:00:00Z")).body.total, 3);
+        // To the second, in UTC, which is how the rows are stored.
+        assert.equal((await between("from=2024-05-04T10:00:00Z&until=2024-05-04T10:00:01Z")).body.total, 1);
+        assert.equal((await between("from=2024-05-04T10:00:01Z")).body.total, 1);
+        // Nothing in range is a normal answer, and the filter still shows in the count.
+        const none = await between("from=2020-01-01T00:00:00Z&until=2020-01-02T00:00:00Z");
+        assert.deepEqual([none.status, none.body.items.length, none.body.total, none.body.nextCursor], [200, 0, 0, null]);
+        // With the members' filter: both apply.
+        const both = await h.request("GET", pool(`userId=${USER}&category=homies&poster=${keyFor(USER)},${keyFor(OTHER_USER)}&from=2024-05-05T00:00:00Z`));
+        assert.deepEqual(both.body.items.map((i: any) => i.url), [rows.mine.url]);
+        assert.equal(both.body.total, 1);
+    });
+
+    test("the cursor walks a stretch of time once, and a bad from or until is refused before any SQL", async () => {
+        for(let i = 0; i < 40; i++) {
+            h.db.add("homies", {url: `https://example.com/t${i}.png`, createdAt: `2024-03-${String(1 + i % 20).padStart(2, "0")} 12:00:00`, userId: i % 2 ? USER : OTHER_USER});
+        }
+        h.db.add("homies", {url: "https://example.com/dateless.png", createdAt: null});
+        const range = "from=2024-03-05T00:00:00Z&until=2024-03-11T00:00:00Z";
+        const expected = h.db.tables.homies
+            .filter(r => r.guildId === GUILD && r.createdAt !== null && r.createdAt >= "2024-03-05 00:00:00" && r.createdAt < "2024-03-11 00:00:00")
+            .sort(compareNewestFirst).map(r => String(r.id));
+        assert.equal(expected.length, 12);
+        const seen: string[] = [];
+        let cursor: string|null = null;
+        do {
+            const res: any = await h.request("GET", pool(`userId=${USER}&category=homies&limit=5&${range}` + (cursor ? `&cursor=${cursor}` : "")));
+            assert.equal(res.status, 200);
+            assert.equal(res.body.total, 12);
+            seen.push(...res.body.items.map((i: any) => i.id));
+            cursor = res.body.nextCursor;
+        } while(cursor);
+        assert.deepEqual(seen, expected, "every row of the range, once, and no dateless one");
+
+        h.db.statements.length = 0;
+        h.discord.memberLookups.length = 0;
+        for(const query of [
+            "from=2024-03-05", "from=2024-03-05T00:00:00", "from=2024-03-05T00:00:00+00:00", "from=2024-13-05T00:00:00Z", "from=2024-02-31T00:00:00Z",
+            "from=yesterday", "from=", "until=", "until=2024-03-05T24:00:00Z", "from=0000-00-00T00:00:00Z",
+            // A range that can hold nothing is a mistake, not an empty answer.
+            "from=2024-03-05T00:00:00Z&until=2024-03-05T00:00:00Z",
+            "from=2024-03-06T00:00:00Z&until=2024-03-05T00:00:00Z"
+        ]) {
+            const res = await h.request("GET", pool(`userId=${USER}&category=homies&${query}`));
+            assert.equal(res.status, 400, query);
+            assert.equal(res.body.error.code, "INVALID_REQUEST", query);
+        }
+        assert.equal(h.db.statements.length, 0);
+        assert.equal(h.discord.memberLookups.length, 0);
+        // The own listing takes no date filter, and ignores one.
+        assert.equal((await h.request("GET", list(`userId=${USER}&category=homies&from=nonsense`))).status, 200);
     });
 
     test("the cursor walks one member's rows with the filter kept, and the key is looked up once", async () => {
@@ -591,7 +715,9 @@ describe("pool", () => {
             cursor = res.body.nextCursor;
         } while(cursor);
         assert.deepEqual(seen, expected);
-        assert.equal(h.db.statements.filter(s => s.sql.startsWith("SELECT DISTINCT")).length, 1);
+        // One build of the guild's key map, which reads both collections, and
+        // every page after the first takes the key from it.
+        assert.equal(h.db.statements.filter(s => s.sql.startsWith("SELECT DISTINCT")).length, 2);
     });
 
     test("the cursor walks the whole pool once, in the listing's order, and total counts the guild", async () => {
@@ -674,6 +800,82 @@ describe("pool", () => {
         const res = await h.request("GET", pool(`userId=${USER}&category=homies`));
         assert.match(res.body.items[0].displayUrl, /^https:\/\/cdn\.discordapp\.com\/attachments\/1\/2\/a\.png\?ex=/);
         assert.equal(res.body.items[0].url, stored);
+    });
+});
+
+describe("guild posters", () => {
+    const posters = (query: string, guildId: string = GUILD) => `/v1/guilds/${guildId}/posters?${query}`;
+
+    function seed() {
+        for(let i = 0; i < 3; i++) h.db.add("homies", {url: `https://example.com/mine-${i}.png`});
+        h.db.add("pets", {url: "https://example.com/my-pet.png"});
+        h.db.add("homies", {url: "https://example.com/theirs.png", userId: OTHER_USER});
+        for(let i = 0; i < 2; i++) h.db.add("pets", {url: `https://example.com/mod-pet-${i}.png`, userId: MOD_USER});
+        // Counts for nobody: no poster at all, and another guild's rows.
+        h.db.add("homies", {url: "https://example.com/orphan.png", userId: null});
+        h.db.add("homies", {url: "https://example.com/elsewhere.png", guildId: OTHER_GUILD, userId: OTHER_USER});
+        h.discord.guildProfiles.set(`${GUILD}:${USER}`, {name: "Me", avatarUrl: "https://cdn.discordapp.com/a.png"});
+        h.discord.guildProfiles.set(`${GUILD}:${MOD_USER}`, {name: "A Mod", avatarUrl: null});
+        h.discord.globalProfiles.set(OTHER_USER, {name: "Other", avatarUrl: null});
+    }
+
+    test("every member who has posted, most first, with their key, their count and no user id", async () => {
+        seed();
+        const res = await h.request("GET", posters(`userId=${USER}`));
+        assert.equal(res.status, 200);
+        assert.deepEqual(res.body, {
+            posters: [
+                {poster: {name: "Me", avatarUrl: "https://cdn.discordapp.com/a.png", key: keyFor(USER)}, mine: true, count: 4},
+                {poster: {name: "A Mod", avatarUrl: null, key: keyFor(MOD_USER)}, mine: false, count: 2},
+                {poster: {name: "Other", avatarUrl: null, key: keyFor(OTHER_USER)}, mine: false, count: 1}
+            ],
+            total: 3
+        });
+        const text = JSON.stringify(res.body);
+        for(const id of [USER, OTHER_USER, MOD_USER, OWNER]) assert.ok(!text.includes(id), `${id} leaked`);
+        // The keys are the ones the pool answers with, so a picked member filters it.
+        const filtered = await h.request("GET", `/v1/guilds/${GUILD}/pool?userId=${USER}&category=pets&poster=${res.body.posters[1].poster.key}`);
+        assert.equal(filtered.body.total, 2);
+        // Whoever asks, the list is the same but for "mine".
+        const asMod = await h.request("GET", posters(`userId=${MOD_USER}`));
+        assert.deepEqual(asMod.body.posters.map((p: any) => [p.poster.key, p.mine, p.count]), [[keyFor(USER), false, 4], [keyFor(MOD_USER), true, 2], [keyFor(OTHER_USER), false, 1]]);
+    });
+
+    test("one collection at a time, and a member with nothing in it is left out", async () => {
+        seed();
+        const homies = await h.request("GET", posters(`userId=${USER}&category=homies`));
+        assert.deepEqual(homies.body.posters.map((p: any) => [p.poster.name, p.count]), [["Me", 3], ["Other", 1]]);
+        assert.equal(homies.body.total, 2);
+        const pets = await h.request("GET", posters(`userId=${USER}&category=pets`));
+        assert.deepEqual(pets.body.posters.map((p: any) => [p.poster.name, p.count]), [["A Mod", 2], ["Me", 1]]);
+        assert.deepEqual((await h.request("GET", posters(`userId=${USER}&category=all`))).body, (await h.request("GET", posters(`userId=${USER}`))).body);
+        // A guild nobody has posted in yet.
+        assert.deepEqual((await h.request("GET", posters(`userId=${USER}`, OTHER_GUILD))).body.posters.map((p: any) => p.count), [1]);
+    });
+
+    test("members only, and the query is checked first", async () => {
+        seed();
+        assert.equal((await h.request("GET", posters(`userId=${STRANGER}`))).status, 403);
+        assert.equal((await h.request("GET", posters(`userId=${OWNER}`))).status, 200);
+        h.db.statements.length = 0;
+        h.discord.memberLookups.length = 0;
+        for(const query of [`userId=${USER}&category=cute`, `userId=${USER}&category=`, "userId=12", ""]) {
+            const res = await h.request("GET", posters(query));
+            assert.equal(res.status, 400, query);
+            assert.equal(res.body.error.code, "INVALID_REQUEST");
+        }
+        assert.equal(h.db.statements.length, 0);
+        assert.equal(h.discord.memberLookups.length, 0);
+        assert.equal((await h.request("GET", posters(`userId=${USER}`, "999999999999999999"))).status, 404);
+        assert.equal((await h.request("POST", posters(`userId=${USER}`))).status, 404);
+        h.discord.ready = false;
+        assert.equal((await h.request("GET", posters(`userId=${USER}`))).status, 503);
+    });
+
+    test("a name Discord could not resolve is null, and the member is still offered", async () => {
+        h.db.add("homies", {url: "https://example.com/ghost.png", userId: "200000000000000006"});
+        const res = await h.request("GET", posters(`userId=${USER}`));
+        assert.deepEqual(res.body.posters, [{poster: {name: null, avatarUrl: null, key: keyFor("200000000000000006")}, mine: false, count: 1}]);
     });
 });
 

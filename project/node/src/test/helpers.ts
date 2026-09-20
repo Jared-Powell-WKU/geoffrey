@@ -70,6 +70,46 @@ export class FakeDb {
         return this.tables[name];
     }
 
+    // The filter clauses listPage builds, in the order it builds them: the
+    // guild, then the scope (the asker's own rows, or the members the pool is
+    // narrowed to), then each end of a date filter. What is left of the
+    // condition is the cursor's, and so are the parameters that go with it.
+    private static scope(rows: FakeRow[], where: string, params: unknown[], sql: string) {
+        if(!where.startsWith("guildId = ?")) throw new Error(`Unexpected SQL: ${sql}`);
+        let condition = where.slice("guildId = ?".length);
+        let values = params.slice(1);
+        let matches = rows.filter(r => r.guildId === params[0]);
+        let m: RegExpExecArray|null;
+        const eat = (clause: string) => {
+            if(!condition.startsWith(clause)) return false;
+            condition = condition.slice(clause.length);
+            return true;
+        };
+        if(eat(" AND userId = ?")) {
+            const userId = values[0];
+            matches = matches.filter(r => r.userId === userId);
+            values = values.slice(1);
+        } else if((m = /^ AND userId IN \(\?(?:, \?)*\)/.exec(condition))) {
+            const count = m[0].split("?").length - 1;
+            const userIds = values.slice(0, count);
+            matches = matches.filter(r => r.userId !== null && userIds.includes(r.userId));
+            condition = condition.slice(m[0].length);
+            values = values.slice(count);
+        }
+        // A NULL date is in no stretch of time, as a NULL fails both comparisons.
+        if(eat(" AND createdAt >= ?")) {
+            const from = values[0] as string;
+            matches = matches.filter(r => r.createdAt !== null && r.createdAt >= from);
+            values = values.slice(1);
+        }
+        if(eat(" AND createdAt < ?")) {
+            const until = values[0] as string;
+            matches = matches.filter(r => r.createdAt !== null && r.createdAt < until);
+            values = values.slice(1);
+        }
+        return {matches, condition, values};
+    }
+
     private static project(row: FakeRow) {
         return {id: row.id, url: row.url, createdAt: row.createdAt === null ? null : row.createdAt.replace(" ", "T") + "Z", source: row.source, channelId: row.channelId, messageId: row.messageId, userId: row.userId};
     }
@@ -97,40 +137,28 @@ export class FakeDb {
             }
             const order = " ORDER BY createdAt DESC, id DESC LIMIT ?";
             if(!where.endsWith(order)) throw new Error(`Unexpected SQL: ${sql}`);
-            let condition = where.slice(0, -order.length);
-            // The scope: one user's rows (the listing) or the whole guild (the pool).
-            let matches: FakeRow[];
-            let rest: unknown[];
-            if(condition.startsWith("guildId = ? AND userId = ?")) {
-                matches = rows.filter(r => r.guildId === params[0] && r.userId === params[1]);
-                condition = condition.slice("guildId = ? AND userId = ?".length);
-                rest = params.slice(2);
-            } else if(condition.startsWith("guildId = ?")) {
-                matches = rows.filter(r => r.guildId === params[0]);
-                condition = condition.slice("guildId = ?".length);
-                rest = params.slice(1);
-            } else {
-                throw new Error(`Unexpected SQL: ${sql}`);
-            }
-            if(condition === " AND (createdAt < ? OR (createdAt = ? AND id < CAST(? AS UNSIGNED)) OR createdAt IS NULL)") {
+            const scoped = FakeDb.scope(rows, where.slice(0, -order.length), params, sql);
+            let matches = scoped.matches;
+            const rest = scoped.values;
+            if(scoped.condition === " AND (createdAt < ? OR (createdAt = ? AND id < CAST(? AS UNSIGNED)) OR createdAt IS NULL)") {
                 const [before, same, id] = rest as string[];
                 matches = matches.filter(r => r.createdAt === null || r.createdAt < before || (r.createdAt === same && r.id < BigInt(id)));
-            } else if(condition === " AND createdAt IS NULL AND id < CAST(? AS UNSIGNED)") {
+            } else if(scoped.condition === " AND createdAt IS NULL AND id < CAST(? AS UNSIGNED)") {
                 matches = matches.filter(r => r.createdAt === null && r.id < BigInt(rest[0] as string));
-            } else if(condition !== "") {
+            } else if(scoped.condition !== "") {
                 throw new Error(`Unexpected SQL: ${sql}`);
             }
             matches.sort(compareNewestFirst);
             return matches.slice(0, params[params.length - 1] as number).map(FakeDb.project);
         }
-        if((m = /^SELECT COUNT\(\*\) AS total FROM (\w+) WHERE guildId = \? AND userId = \?$/.exec(sql))) {
-            return [{total: BigInt(this.table(m[1]).filter(r => r.guildId === params[0] && r.userId === params[1]).length)}];
-        }
-        if((m = /^SELECT COUNT\(\*\) AS total FROM (\w+) WHERE guildId = \?$/.exec(sql))) {
-            return [{total: BigInt(this.table(m[1]).filter(r => r.guildId === params[0]).length)}];
-        }
         if((m = /^SELECT COUNT\(\*\) AS total FROM (\w+) WHERE guildId = \? AND messageId = \?$/.exec(sql))) {
             return [{total: BigInt(this.table(m[1]).filter(r => r.guildId === params[0] && r.messageId === params[1]).length)}];
+        }
+        // The listings' total, over the same filters as the page itself.
+        if((m = /^SELECT COUNT\(\*\) AS total FROM (\w+) WHERE (.*)$/.exec(sql))) {
+            const scoped = FakeDb.scope(this.table(m[1]), m[2], params, sql);
+            if(scoped.condition !== "") throw new Error(`Unexpected SQL: ${sql}`);
+            return [{total: BigInt(scoped.matches.length)}];
         }
         // The posters of a guild, for turning a poster key back into a user id.
         if((m = /^SELECT DISTINCT userId FROM (\w+) WHERE guildId = \? AND userId IS NOT NULL$/.exec(sql))) {

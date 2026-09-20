@@ -4,7 +4,7 @@ import { test, describe, before, after } from "node:test";
 import * as assert from "node:assert/strict";
 import * as http from "node:http";
 import * as mariadb from "mariadb";
-import { createInternalApi } from "../internalApi";
+import { createInternalApi, posterKeyOf } from "../internalApi";
 import { mediaKey, QueryFn, removalSql, removeImageByUrl, removeImagesForMessages, removeRows, TransactionFn } from "../util/imageRemoval";
 import { createDbAccess } from "../util/dbAccess";
 import { insertAttachmentsSql } from "../util/submissionSql";
@@ -102,6 +102,68 @@ describe("internal API against MariaDB", {skip: TEST_DB_PORT ? false : "TEST_DB_
             assert.deepEqual(seen.filter(i => i.messageUrl !== null).map(i => i.messageUrl), new Array(2).fill(`https://discord.com/channels/${GUILD}/300000000000000001/400000000000000001`));
         }
         assert.equal((await request("GET", `/v1/guilds/${GUILD}/pool?userId=200000000000000009&category=homies`)).body.error.code, "NOT_A_MEMBER");
+    });
+
+    test("the pool's filters narrow it to members and to a stretch of time, and the totals agree with the database", async () => {
+        const keyFor = (userId: string) => posterKeyOf(KEY, GUILD, userId);
+        const order = "ORDER BY createdAt IS NULL, createdAt DESC, id DESC";
+        const idsOf = async (where: string, params: unknown[]) =>
+            (await query(`SELECT CAST(id AS CHAR) AS id FROM homies WHERE guildId = ? AND ${where} ${order}`, [GUILD, ...params]) as any[]).map(r => r.id);
+        const poolOf = (filters: string) => request("GET", `/v1/guilds/${GUILD}/pool?userId=${USER}&category=homies&limit=48&${filters}`);
+
+        // One member, then two of them together.
+        for(const userIds of [[OTHER_USER], [USER, OTHER_USER]]) {
+            const expected = await idsOf(`userId IN (${userIds.map(() => "?").join(", ")})`, userIds);
+            const res: any = await poolOf(`poster=${userIds.map(keyFor).join(",")}`);
+            assert.equal(res.status, 200);
+            assert.equal(res.body.total, expected.length);
+            assert.deepEqual(res.body.items.map((i: any) => i.id), expected.slice(0, 48));
+            assert.deepEqual(res.body.posters.map((p: any) => p.key), userIds.map(keyFor));
+            assert.ok(!JSON.stringify(res.body).includes(USER) && !JSON.stringify(res.body).includes(OTHER_USER));
+        }
+        // 62 of the 63 rows have a poster; the orphan belongs to nobody.
+        assert.equal((await poolOf(`poster=${[USER, OTHER_USER].map(keyFor).join(",")}`)).body.total, 62);
+
+        // A stretch of time, paged through with the filter kept, and without
+        // the rows whose date is unknown.
+        const from = "2024-03-03 00:00:00", until = "2024-03-07 00:00:00";
+        const inRange = await idsOf("createdAt >= ? AND createdAt < ?", [from, until]);
+        assert.ok(inRange.length > 10 && inRange.length < 63);
+        const seen: string[] = [];
+        let cursor: string|null = null;
+        do {
+            const res: any = await request("GET", `/v1/guilds/${GUILD}/pool?userId=${USER}&category=homies&limit=5&from=2024-03-03T00:00:00Z&until=2024-03-07T00:00:00Z` + (cursor ? `&cursor=${cursor}` : ""));
+            assert.equal(res.status, 200);
+            assert.equal(res.body.total, inRange.length);
+            assert.ok(res.body.items.every((i: any) => i.createdAt >= "2024-03-03T00:00:00Z" && i.createdAt < "2024-03-07T00:00:00Z"));
+            seen.push(...res.body.items.map((i: any) => i.id));
+            cursor = res.body.nextCursor;
+        } while(cursor);
+        assert.deepEqual(seen, inRange);
+
+        // Both filters at once, and a range of one second.
+        const both: any = await poolOf(`poster=${keyFor(OTHER_USER)}&from=2024-03-03T00:00:00Z&until=2024-03-07T00:00:00Z`);
+        assert.deepEqual(both.body.items.map((i: any) => i.id), await idsOf("userId = ? AND createdAt >= ? AND createdAt < ?", [OTHER_USER, from, until]));
+        const exact: any = await poolOf("from=2024-03-03T08:00:00Z&until=2024-03-03T08:00:01Z");
+        assert.deepEqual(exact.body.items.map((i: any) => i.id), await idsOf("createdAt = ?", ["2024-03-03 08:00:00"]));
+        assert.equal((await poolOf("from=2030-01-01T00:00:00Z")).body.total, 0);
+    });
+
+    test("the posters route counts the guild's members against the database", async () => {
+        const counts: any[] = await query("SELECT userId, COUNT(*) AS count FROM homies WHERE guildId = ? AND userId IS NOT NULL GROUP BY userId ORDER BY COUNT(*) DESC", [GUILD]);
+        const res: any = await request("GET", `/v1/guilds/${GUILD}/posters?userId=${USER}&category=homies`);
+        assert.equal(res.status, 200);
+        assert.equal(res.body.total, counts.length);
+        assert.deepEqual(res.body.posters.map((p: any) => p.count), counts.map(r => Number(r.count)));
+        assert.deepEqual(res.body.posters.map((p: any) => p.poster.key), counts.map(r => posterKeyOf(KEY, GUILD, String(r.userId))));
+        assert.deepEqual(res.body.posters.map((p: any) => p.mine), counts.map(r => String(r.userId) === USER));
+        assert.equal(typeof res.body.posters[0].count, "number");
+        assert.ok(!JSON.stringify(res.body).includes(USER) && !JSON.stringify(res.body).includes(OTHER_USER));
+        // Every key it offers narrows the pool to that member.
+        for(const entry of res.body.posters) {
+            const filtered: any = await request("GET", `/v1/guilds/${GUILD}/pool?userId=${USER}&category=homies&poster=${entry.poster.key}`);
+            assert.equal(filtered.body.total, entry.count);
+        }
     });
 
     test("add stores a web row with a UTC timestamp, and a duplicate is 409", async () => {
@@ -321,7 +383,7 @@ describe("internal API against MariaDB", {skip: TEST_DB_PORT ? false : "TEST_DB_
             ]);
             assert.equal(typeof res.body.entries[1].mediaCount, "number");
             assert.deepEqual([res.body.entries[1].item.mine, res.body.entries[1].item.canDelete, res.body.entries[1].item.messageUrl], [true, true, `https://discord.com/channels/${LG}/${channel}/${message(1)}`]);
-            assert.deepEqual([res.body.entries[3].item.poster, res.body.entries[3].item.mine, res.body.entries[3].item.canDelete], [{name: null, avatarUrl: null}, false, false]);
+            assert.deepEqual([res.body.entries[3].item.poster.name, res.body.entries[3].item.poster.avatarUrl, res.body.entries[3].item.mine, res.body.entries[3].item.canDelete], [null, null, false, false]);
             res = await boardOf("posts-by-flashes", "&category=homies&limit=2");
             assert.deepEqual(res.body.entries.map((e: any) => [e.rank, e.score, e.item.url]), [[1, 3, cdnOf(6)], [1, 3, cdnOf(1)]]);
             assert.deepEqual(res.body.coverage, {counted: 5, total: 5});

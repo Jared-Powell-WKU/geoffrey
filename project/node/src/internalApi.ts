@@ -51,6 +51,16 @@ const ROW_ID = /^[0-9]{1,20}$/;
 // A poster key: the first 16 bytes of an HMAC in base64url, see posterKeyOf.
 const POSTER_KEY_BYTES = 16;
 const POSTER_KEY = /^[A-Za-z0-9_-]{22}$/;
+// How many members the pool can be narrowed to at once. The site offers a
+// picker, so this only bounds a hand-written address.
+export const MAX_POSTER_FILTERS = 25;
+// The guild's poster keys are worked out from its own rows, so the map is
+// cached. A member's first submission makes a key the map does not have, and
+// a miss rebuilds a map older than this, so such a key works within seconds.
+const POSTER_KEY_MAP_TTL_MS = 60_000;
+const POSTER_KEY_REBUILD_MS = 5_000;
+// The members the picker is offered. A guild has a few hundred posters at most.
+export const MAX_GUILD_POSTERS = 500;
 const CURSOR_DATE = /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$/;
 const ER_DUP_ENTRY = 1062;
 // Unknown Member, Unknown User.
@@ -137,6 +147,13 @@ interface LeaderboardUserEntry {
     score: number
 }
 
+// One member of the guild's whole cast of posters, for the site's filter.
+interface GuildPoster {
+    poster: PublicPoster,
+    mine: boolean,
+    count: number
+}
+
 interface LeaderboardPostEntry {
     rank: number,
     item: PoolItem,
@@ -191,6 +208,11 @@ export function parseOwnerUserId(raw: string|undefined): {ownerUserId: string|nu
 // guessed one without the API key. A new API key gives everyone new keys.
 export function posterKeyOf(secret: string, guildId: string, userId: string): string {
     return createHmac("sha256", secret).update(`poster:${guildId}:${userId}`, "utf8").digest().subarray(0, POSTER_KEY_BYTES).toString("base64url");
+}
+
+// A row's poster, when the row has one the bot could store.
+export function posterIdOf(value: unknown): string|null {
+    return typeof value === "string" && DISCORD_ID.test(value) ? value : null;
 }
 
 export function messageUrlOf(guildId: string, channelId: unknown, messageId: unknown): string|null {
@@ -295,9 +317,9 @@ export function createInternalApi(deps: InternalApiDeps): http.Server {
     const accessCache = new Map<string, {access: Access, expiresAt: number}>();
     const posterCache = new Map<string, {poster: Poster, expiresAt: number}>();
     const refreshCache = new Map<string, {displayUrl: string, expiresAt: number}>();
-    // "<guildId>:<posterKey>" to the user id it was made from. A key never
-    // changes meaning, so there is no expiry, only the bound.
-    const posterKeyCache = new Map<string, string>();
+    // Per guild: every poster key of that guild to the user id it was made
+    // from, and when the map was built. See posterKeyMap.
+    const posterKeyMaps = new Map<string, {keys: Map<string, string>, builtAt: number}>();
 
     function isAuthorized(header: string|undefined): boolean {
         const match = /^Bearer (.+)$/i.exec(header || "");
@@ -351,33 +373,75 @@ export function createInternalApi(deps: InternalApiDeps): http.Server {
         return {category, categories: [category]};
     }
 
-    // Null when absent. The shape only; whether it names anyone is found later.
-    function parsePosterKey(value: string|null): string|null {
+    // Empty when absent. The shapes only; which keys name anyone is found later.
+    function parsePosterKeys(value: string|null): string[] {
+        if(value === null) return [];
+        const keys = value.split(",");
+        if(keys.length > MAX_POSTER_FILTERS) throw invalid(`poster takes at most ${MAX_POSTER_FILTERS} keys.`);
+        const unique: string[] = [];
+        for(const key of keys) {
+            if(!POSTER_KEY.test(key)) throw invalid("poster is not a valid poster key.");
+            if(!unique.includes(key)) unique.push(key);
+        }
+        return unique;
+    }
+
+    // One end of a date filter, as an instant: the site works the viewer's own
+    // dates out into these, so a day means their day. Null when absent.
+    function parseInstant(value: string|null, name: string): string|null {
         if(value === null) return null;
-        if(!POSTER_KEY.test(value)) throw invalid("poster is not a valid poster key.");
-        return value;
+        const time = CURSOR_DATE.test(value) ? Date.parse(value) : NaN;
+        // A day that does not exist rolls over in JavaScript (the 31st of
+        // February becomes the 2nd of March), so the instant has to come back
+        // out as it went in for it to be a real one.
+        if(Number.isNaN(time) || `${new Date(time).toISOString().slice(0, 19)}Z` !== value) {
+            throw invalid(`${name} must be an instant as YYYY-MM-DDTHH:MM:SSZ.`);
+        }
+        // How createdAt is stored: UTC, without the T and the Z.
+        return value.replace("T", " ").replace("Z", "");
     }
 
     const keyOf = (guildId: string, userId: string) => posterKeyOf(config.key, guildId, userId);
 
-    // The user id a poster key stands for, or null when nobody in the guild's
-    // tables has that key. An HMAC cannot be reversed, so the guild's distinct
-    // posters (a few hundred) are keyed and compared; the answer is cached.
-    async function resolvePosterKey(guildId: string, posterKey: string): Promise<string|null> {
-        const cacheKey = `${guildId}:${posterKey}`;
-        const cached = posterKeyCache.get(cacheKey);
-        if(cached !== undefined) return cached;
+    // Every poster key of a guild to the user id it was made from. An HMAC
+    // cannot be reversed, so a key is resolved by keying the guild's own
+    // posters (a few hundred) and comparing. Cached for a minute.
+    async function posterKeyMap(guildId: string): Promise<Map<string, string>> {
+        const cached = posterKeyMaps.get(guildId);
+        if(cached && cached.builtAt + POSTER_KEY_MAP_TTL_MS > now()) return cached.keys;
+        const keys = new Map<string, string>();
         for(const category of CATEGORIES) {
             const rows: any[] = await query(`SELECT DISTINCT userId FROM ${tableFor(category)} WHERE guildId = ? AND userId IS NOT NULL`, [guildId]);
             for(const row of rows) {
-                const userId = typeof row.userId === "string" && DISCORD_ID.test(row.userId) ? row.userId : null;
-                if(userId !== null && keyOf(guildId, userId) === posterKey) {
-                    setBounded(posterKeyCache, cacheKey, userId);
-                    return userId;
-                }
+                const userId = posterIdOf(row.userId);
+                if(userId !== null) keys.set(keyOf(guildId, userId), userId);
             }
         }
-        return null;
+        setBounded(posterKeyMaps, guildId, {keys, builtAt: now()});
+        return keys;
+    }
+
+    // The user ids these keys stand for, in the order given, without the keys
+    // that name nobody who has a row in this guild.
+    async function resolvePosterKeys(guildId: string, posterKeys: string[]): Promise<string[]> {
+        if(!posterKeys.length) return [];
+        let keys = await posterKeyMap(guildId);
+        // A key made from a row stored since the map was built is not in it, so
+        // a map that is not brand new is built again before a key is given up
+        // on. The age check keeps a run of unknown keys from scanning per call.
+        if(posterKeys.some(key => !keys.has(key))) {
+            const cached = posterKeyMaps.get(guildId);
+            if(cached && cached.builtAt + POSTER_KEY_REBUILD_MS < now()) {
+                posterKeyMaps.delete(guildId);
+                keys = await posterKeyMap(guildId);
+            }
+        }
+        const userIds: string[] = [];
+        for(const key of posterKeys) {
+            const userId = keys.get(key);
+            if(userId !== undefined && !userIds.includes(userId)) userIds.push(userId);
+        }
+        return userIds;
     }
 
     // The poster of a response: the Discord profile, if resolved, and the key.
@@ -525,13 +589,17 @@ export function createInternalApi(deps: InternalApiDeps): http.Server {
     }
 
     // The listing and the pool are one query; only the scope differs: the
-    // asker's own rows, every row of the guild, or (the pool with a poster
-    // key) every row of one member. All check membership first.
+    // asker's own rows, or every row of the guild, which the pool's filters
+    // then narrow to some members and a stretch of time. All check membership
+    // first, and the filters are the same for the page and for its total.
     async function listPage(guildId: string, params: URLSearchParams, scope: "own"|"pool") {
         const userId = parseDiscordId(params.get("userId"), "userId");
         const category = parseCategory(params.get("category"));
         const limit = parseLimit(params.get("limit"), MAX_LIMIT, MAX_LIMIT);
-        const posterKey = scope === "pool" ? parsePosterKey(params.get("poster")) : null;
+        const posterKeys = scope === "pool" ? parsePosterKeys(params.get("poster")) : [];
+        const from = scope === "pool" ? parseInstant(params.get("from"), "from") : null;
+        const until = scope === "pool" ? parseInstant(params.get("until"), "until") : null;
+        if(from !== null && until !== null && from >= until) throw invalid("from must be before until.");
         let cursor: {createdAt: string|null, id: string}|null = null;
         const rawCursor = params.get("cursor");
         if(rawCursor !== null) {
@@ -541,19 +609,36 @@ export function createInternalApi(deps: InternalApiDeps): http.Server {
         const {guild} = getGuild(guildId);
         const access = await requireMember(guild, userId);
 
-        // The member the pool is narrowed to. A key that names nobody in this
-        // guild has nothing to list, and no statement is run for it.
-        const posterId = posterKey !== null ? await resolvePosterKey(guildId, posterKey) : null;
-        if(posterKey !== null && posterId === null) {
-            return {userId, access, page: [], items: [], nextCursor: null, total: 0, posterKey, posterId};
+        // The members the pool is narrowed to. Keys that name nobody in this
+        // guild have nothing to list, and no statement is run for them.
+        const posterIds = await resolvePosterKeys(guildId, posterKeys);
+        if(posterKeys.length && !posterIds.length) {
+            return {userId, access, page: [], items: [], nextCursor: null, total: 0, posterKeys, posterIds};
         }
 
         const table = tableFor(category);
-        const scopeUserId = scope === "own" ? userId : posterId;
-        const scopeWhere = scopeUserId !== null ? "guildId = ? AND userId = ?" : "guildId = ?";
-        const scopeValues: unknown[] = scopeUserId !== null ? [guildId, scopeUserId] : [guildId];
-        let where = scopeWhere;
-        const values: unknown[] = [...scopeValues];
+        const filters = ["guildId = ?"];
+        const filterValues: unknown[] = [guildId];
+        if(scope === "own") {
+            filters.push("userId = ?");
+            filterValues.push(userId);
+        } else if(posterIds.length) {
+            filters.push(`userId IN (${posterIds.map(() => "?").join(", ")})`);
+            filterValues.push(...posterIds);
+        }
+        // A row whose date is unknown is in no stretch of time, and a NULL
+        // fails both comparisons, so it drops out of a filtered answer by itself.
+        if(from !== null) {
+            filters.push("createdAt >= ?");
+            filterValues.push(from);
+        }
+        if(until !== null) {
+            filters.push("createdAt < ?");
+            filterValues.push(until);
+        }
+        const filterWhere = filters.join(" AND ");
+        let where = filterWhere;
+        const values: unknown[] = [...filterValues];
         if(cursor && cursor.createdAt !== null) {
             const createdAt = cursor.createdAt.replace("T", " ").replace("Z", "");
             where += " AND (createdAt < ? OR (createdAt = ? AND id < CAST(? AS UNSIGNED)) OR createdAt IS NULL)";
@@ -564,7 +649,7 @@ export function createInternalApi(deps: InternalApiDeps): http.Server {
         }
         // MariaDB sorts NULL lowest, so DESC already puts unknown dates last.
         const rows: any[] = await query(`SELECT ${SUBMISSION_COLUMNS} FROM ${table} WHERE ${where} ORDER BY createdAt DESC, id DESC LIMIT ?`, [...values, limit + 1]);
-        const counted = await query(`SELECT COUNT(*) AS total FROM ${table} WHERE ${scopeWhere}`, scopeValues);
+        const counted = await query(`SELECT COUNT(*) AS total FROM ${table} WHERE ${filterWhere}`, filterValues);
         const page = rows.slice(0, limit);
         const items = await toSubmissions(page, category, guildId);
         const last = items[items.length - 1];
@@ -572,7 +657,7 @@ export function createInternalApi(deps: InternalApiDeps): http.Server {
             userId, access, page, items,
             nextCursor: rows.length > limit && last ? encodeCursor(last.createdAt, last.id) : null,
             total: Number(counted?.[0]?.total ?? 0),
-            posterKey, posterId
+            posterKeys, posterIds
         };
     }
 
@@ -582,26 +667,54 @@ export function createInternalApi(deps: InternalApiDeps): http.Server {
     }
 
     async function listPool(guildId: string, params: URLSearchParams) {
-        const {userId, access, page, items, nextCursor, total, posterKey, posterId: filteredId} = await listPage(guildId, params, "pool");
-        const posterOf = (row: any): string|null => typeof row.userId === "string" && DISCORD_ID.test(row.userId) ? row.userId : null;
-        // The member the pool is narrowed to is named in the answer even when
+        const {userId, access, page, items, nextCursor, total, posterKeys, posterIds} = await listPage(guildId, params, "pool");
+        // The members the pool is narrowed to are named in the answer even when
         // this category has nothing of theirs, so the page can say whose it is.
-        const wanted = page.map(posterOf).filter((id): id is string => id !== null);
-        if(filteredId !== null) wanted.push(filteredId);
-        const posters = await resolvePosters(guildId, wanted);
+        const wanted = page.map(row => posterIdOf(row.userId)).filter((id): id is string => id !== null);
+        const profiles = await resolvePosters(guildId, [...wanted, ...posterIds]);
         const poolItems: PoolItem[] = items.map((item, index) => {
-            const posterId = posterOf(page[index]);
+            const posterId = posterIdOf(page[index].userId);
             const mine = posterId !== null && posterId === userId;
             // The poster's id decides these three fields and goes no further.
             return {
                 ...item,
-                poster: publicPoster(guildId, posterId, posters),
+                poster: publicPoster(guildId, posterId, profiles),
                 mine,
                 canDelete: mine || access.moderator
             };
         });
-        if(posterKey === null) return {items: poolItems, nextCursor, total};
-        return {items: poolItems, nextCursor, total, poster: filteredId !== null ? publicPoster(guildId, filteredId, posters) : null};
+        if(!posterKeys.length) return {items: poolItems, nextCursor, total};
+        return {items: poolItems, nextCursor, total, posters: posterIds.map(posterId => publicPoster(guildId, posterId, profiles))};
+    }
+
+    // Everyone who has a row in the guild, most submissions first, for the
+    // site's member filter. No cursor: a guild has a few hundred posters, and
+    // `total` says so when there are more than the answer carries.
+    async function listPosters(guildId: string, params: URLSearchParams) {
+        const userId = parseDiscordId(params.get("userId"), "userId");
+        const {categories} = parseLeaderboardCategory(params.get("category"));
+        const {guild} = getGuild(guildId);
+        await requireMember(guild, userId);
+        const counts = new Map<string, number>();
+        for(const category of categories) {
+            const rows: any[] = await query(`SELECT userId, COUNT(*) AS score FROM ${tableFor(category)} WHERE guildId = ? AND userId IS NOT NULL GROUP BY userId`, [guildId]);
+            for(const row of rows) {
+                const posterId = posterIdOf(row.userId);
+                if(posterId === null) continue;
+                counts.set(posterId, (counts.get(posterId) || 0) + Number(row.score ?? 0));
+            }
+        }
+        const top = [...counts.entries()]
+            .filter(([, count]) => count > 0)
+            .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1))
+            .slice(0, MAX_GUILD_POSTERS);
+        const profiles = await resolvePosters(guildId, top.map(([posterId]) => posterId));
+        const posters: GuildPoster[] = top.map(([posterId, count]) => ({
+            poster: publicPoster(guildId, posterId, profiles),
+            mine: posterId === userId,
+            count
+        }));
+        return {posters, total: counts.size};
     }
 
     // A ranking of the guild's collection. Every board reads whole tables (a
@@ -614,7 +727,6 @@ export function createInternalApi(deps: InternalApiDeps): http.Server {
         const limit = parseLimit(params.get("limit"), DEFAULT_LEADERBOARD_LIMIT, MAX_LEADERBOARD_LIMIT);
         const {guild} = getGuild(guildId);
         const access = await requireMember(guild, userId);
-        const posterOf = (value: unknown): string|null => typeof value === "string" && DISCORD_ID.test(value) ? value : null;
 
         if(board === "users-by-submissions" || board === "users-by-reactions") {
             // Per table, then added up per poster across the tables.
@@ -628,7 +740,7 @@ export function createInternalApi(deps: InternalApiDeps): http.Server {
                     ? await query(`SELECT userId, COUNT(*) AS score FROM ${table} WHERE guildId = ? AND userId IS NOT NULL GROUP BY userId`, [guildId])
                     : await query(`SELECT userId, SUM(reactions) AS score FROM (SELECT messageId, MIN(userId) AS userId, MAX(reactionCount) AS reactions FROM ${table} WHERE guildId = ? AND userId IS NOT NULL AND messageId IS NOT NULL AND reactionCount IS NOT NULL GROUP BY messageId) posts GROUP BY userId`, [guildId]);
                 for(const row of rows) {
-                    const posterId = posterOf(row.userId);
+                    const posterId = posterIdOf(row.userId);
                     if(posterId === null) continue;
                     scores.set(posterId, (scores.get(posterId) || 0) + Number(row.score ?? 0));
                 }
@@ -663,7 +775,7 @@ export function createInternalApi(deps: InternalApiDeps): http.Server {
         const top = scored
             .sort((a, b) => b.score - a.score || compareRowsNewestFirst(a.row, b.row))
             .slice(0, limit);
-        const posters = await resolvePosters(guildId, top.map(entry => posterOf(entry.row.userId)).filter((id): id is string => id !== null));
+        const posters = await resolvePosters(guildId, top.map(entry => posterIdOf(entry.row.userId)).filter((id): id is string => id !== null));
         const ranks = rankOf(top, entry => entry.score);
         const entries: LeaderboardPostEntry[] = [];
         // toSubmissions refreshes display URLs in batches, so one call per category.
@@ -671,7 +783,7 @@ export function createInternalApi(deps: InternalApiDeps): http.Server {
             const ofCategory = top.filter(entry => entry.category === tableCategory);
             const items = await toSubmissions(ofCategory.map(entry => entry.row), tableCategory, guildId);
             ofCategory.forEach((entry, index) => {
-                const posterId = posterOf(entry.row.userId);
+                const posterId = posterIdOf(entry.row.userId);
                 const mine = posterId !== null && posterId === userId;
                 entries[top.indexOf(entry)] = {
                     rank: ranks[top.indexOf(entry)],
@@ -846,6 +958,11 @@ export function createInternalApi(deps: InternalApiDeps): http.Server {
             const guildId = parseDiscordId(segments[2], "guildId");
             if(!discord.isReady()) throw notReady();
             return {status: 200, body: await listPool(guildId, url.searchParams)};
+        }
+        if(segments.length === 4 && segments[1] === "guilds" && segments[3] === "posters" && method === "GET") {
+            const guildId = parseDiscordId(segments[2], "guildId");
+            if(!discord.isReady()) throw notReady();
+            return {status: 200, body: await listPosters(guildId, url.searchParams)};
         }
         if(segments.length === 4 && segments[1] === "guilds" && segments[3] === "leaderboard" && method === "GET") {
             const guildId = parseDiscordId(segments[2], "guildId");
