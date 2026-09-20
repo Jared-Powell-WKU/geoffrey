@@ -4,7 +4,7 @@
 # data is lost and the deployed bot's SQL keeps working: first 001 and 002 on
 # the original shape, then 003 on that result with duplicates of every kind
 # seen in production, then 004 on an archive that holds rows of every reason,
-# then 005 on that, checking that the image deployed before it still works.
+# then 005 and 006 on that, checking that the image deployed before them still works.
 # Then runs the internal API's integration test against the same database when
 # it has been compiled (cd project/node && npm test).
 #
@@ -231,7 +231,7 @@ allrows > "$WORK/live-after004"
 if diff -q "$WORK/live-before004" "$WORK/live-after004" >/dev/null; then pass "004 does not touch homies or pets"; else fail "004 changed live rows"; fi
 if q "INSERT INTO submissions_archive (category, id, url, guildId, reason) VALUES ('homies', 900009, 'https://example.com/x.png', '$G3', 'removed_on_site')" 2>/dev/null; then fail "a person-initiated reason can still be archived"; else pass "a person-initiated reason can no longer be archived"; fi
 
-echo "Before 005"
+echo "Before 005 and 006"
 POOL_QUERY="SELECT id FROM homies WHERE guildId = '500000000000000001' ORDER BY createdAt DESC, id DESC LIMIT 49"
 POOL_PAGE_QUERY="SELECT id FROM homies WHERE guildId = '500000000000000001' AND (createdAt < '2023-04-24 10:08:00' OR (createdAt = '2023-04-24 10:08:00' AND id < 100) OR createdAt IS NULL) ORDER BY createdAt DESC, id DESC LIMIT 49"
 # Why 005 adds an index: without it the pool query sorts every row of the guild for each page.
@@ -241,17 +241,18 @@ fullrows() { q "SELECT 'homies', $FULLCOLS FROM homies UNION ALL SELECT 'pets', 
 fullrows > "$WORK/before005"
 q "SELECT $ARCHIVECOLS FROM submissions_archive ORDER BY archiveId" > "$WORK/archive-before005"
 
-echo "Applying 005 and anything later"
+echo "Applying 005, 006 and anything later"
 for f in "$HERE"/migrations/00[5-9]_*.sql "$HERE"/migrations/0[1-9][0-9]_*.sql; do
     [ -f "$f" ] || continue
     apply "$f" && pass "applied $(basename "$f")" || fail "applying $(basename "$f")"
 done
 fullrows > "$WORK/after005"
-if diff -q "$WORK/before005" "$WORK/after005" >/dev/null; then pass "every homies and pets row is byte-for-byte unchanged by 005 ($(wc -l < "$WORK/after005" | tr -d ' ') rows)"; else fail "005 changed or lost rows"; diff "$WORK/before005" "$WORK/after005" | head -10; fi
+if diff -q "$WORK/before005" "$WORK/after005" >/dev/null; then pass "every homies and pets row is byte-for-byte unchanged by 005 and 006 ($(wc -l < "$WORK/after005" | tr -d ' ') rows)"; else fail "005 or 006 changed or lost rows"; diff "$WORK/before005" "$WORK/after005" | head -10; fi
 q "SELECT $ARCHIVECOLS FROM submissions_archive ORDER BY archiveId" > "$WORK/archive-after005"
-if diff -q "$WORK/archive-before005" "$WORK/archive-after005" >/dev/null; then pass "005 does not touch the archive"; else fail "005 changed the archive"; fi
+if diff -q "$WORK/archive-before005" "$WORK/archive-after005" >/dev/null; then pass "005 and 006 do not touch the archive"; else fail "005 or 006 changed the archive"; fi
 for t in homies pets; do
-    check "$t.originCheckedAt is a nullable DATETIME, the last column, NULL everywhere" "$(q "SELECT CONCAT(COLUMN_TYPE, ' ', IS_NULLABLE, ' ', ORDINAL_POSITION = (SELECT MAX(ORDINAL_POSITION) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = 'tncord' AND TABLE_NAME = '$t'), ' ', (SELECT COUNT(*) FROM $t WHERE originCheckedAt IS NOT NULL)) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = 'tncord' AND TABLE_NAME = '$t' AND COLUMN_NAME = 'originCheckedAt'")" "datetime YES 1 0"
+    check "$t.originCheckedAt is a nullable DATETIME, NULL everywhere" "$(q "SELECT CONCAT(COLUMN_TYPE, ' ', IS_NULLABLE, ' ', (SELECT COUNT(*) FROM $t WHERE originCheckedAt IS NOT NULL)) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = 'tncord' AND TABLE_NAME = '$t' AND COLUMN_NAME = 'originCheckedAt'")" "datetime YES 0"
+    check "$t reaction columns are nullable, the last three, NULL everywhere" "$(q "SELECT CONCAT(GROUP_CONCAT(CONCAT(COLUMN_NAME, ':', COLUMN_TYPE, ':', IS_NULLABLE) ORDER BY ORDINAL_POSITION), ' ', MAX(ORDINAL_POSITION) = (SELECT MAX(ORDINAL_POSITION) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = 'tncord' AND TABLE_NAME = '$t'), ' ', (SELECT COUNT(*) FROM $t WHERE reactionCount IS NOT NULL OR flashCount IS NOT NULL OR reactionsCheckedAt IS NOT NULL)) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = 'tncord' AND TABLE_NAME = '$t' AND COLUMN_NAME IN ('reactionCount', 'flashCount', 'reactionsCheckedAt')")" "reactionCount:int(10) unsigned:YES,flashCount:int(10) unsigned:YES,reactionsCheckedAt:datetime:YES 1 0"
     check "$t has the pool index" "$(q "SELECT GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = 'tncord' AND TABLE_NAME = '$t' AND INDEX_NAME = '${t}_pool_IDX'")" "guildId,createdAt,id"
     check "$t primary key is still (url, guildId)" "$(q "SELECT GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = 'tncord' AND TABLE_NAME = '$t' AND INDEX_NAME = 'PRIMARY'")" "url,guildId"
 done
@@ -260,7 +261,7 @@ check "the pool query reads the pool index in order, without sorting" "$(q "EXPL
 check "a later pool page does too" "$(q "EXPLAIN $POOL_PAGE_QUERY" | awk -F'\t' '{print $6, ($10 ~ /filesort/ ? "filesort" : "no-filesort")}')" "homies_pool_IDX no-filesort"
 check "the listing query still uses the listing index" "$(q "EXPLAIN SELECT id FROM homies WHERE guildId = '500000000000000001' AND userId = '600000000000000001' ORDER BY createdAt DESC, id DESC LIMIT 49" | awk -F'\t' '{print $6}')" "homies_listing_IDX"
 
-echo "The image deployed before 005, against the new shape"
+echo "The image deployed before 005 and 006, against the new shape"
 # Migrations run before the containers are replaced, and a failed deploy rolls
 # the image back but not the schema, so these must keep working.
 PREV_URL="$A/1400000000000000777/previous_image.png$NEW"

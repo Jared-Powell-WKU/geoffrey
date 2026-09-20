@@ -13,6 +13,9 @@ CREATE TABLE tncord.pets (
 		     ELSE `url` END
 	) PERSISTENT,
 	`originCheckedAt` datetime DEFAULT NULL,
+	`reactionCount` int(10) unsigned DEFAULT NULL,
+	`flashCount` int(10) unsigned DEFAULT NULL,
+	`reactionsCheckedAt` datetime DEFAULT NULL,
 	CONSTRAINT pets_PK PRIMARY KEY (`url`,`guildId`),
 	UNIQUE KEY pets_id_UK (`id`),
 	UNIQUE KEY pets_media_UK (`guildId`,`mediaKey`),

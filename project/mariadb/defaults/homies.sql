@@ -13,6 +13,9 @@ CREATE TABLE tncord.homies (
 		     ELSE `url` END
 	) PERSISTENT,
 	`originCheckedAt` datetime DEFAULT NULL,
+	`reactionCount` int(10) unsigned DEFAULT NULL,
+	`flashCount` int(10) unsigned DEFAULT NULL,
+	`reactionsCheckedAt` datetime DEFAULT NULL,
 	CONSTRAINT homies_PK PRIMARY KEY (`url`,`guildId`),
 	UNIQUE KEY homies_id_UK (`id`),
 	UNIQUE KEY homies_media_UK (`guildId`,`mediaKey`),

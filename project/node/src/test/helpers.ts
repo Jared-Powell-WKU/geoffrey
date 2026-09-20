@@ -28,7 +28,10 @@ export interface FakeRow {
     source: string,
     channelId: string|null,
     messageId: string|null,
-    originCheckedAt?: string|null
+    originCheckedAt?: string|null,
+    reactionCount?: number|null,
+    flashCount?: number|null,
+    reactionsCheckedAt?: string|null
 }
 
 // Understands exactly the statements internalApi.ts issues and nothing else,
@@ -42,9 +45,24 @@ export class FakeDb {
     clock: () => number = Date.now;
 
     add(table: string, row: Partial<FakeRow> & {url: string}): FakeRow {
-        const full: FakeRow = {id: this.nextId++, guildId: GUILD, userId: USER, createdAt: null, source: "discord", channelId: null, messageId: null, ...row};
+        const full: FakeRow = {id: this.nextId++, guildId: GUILD, userId: USER, createdAt: null, source: "discord", channelId: null, messageId: null, reactionCount: null, flashCount: null, reactionsCheckedAt: null, ...row};
         this.tables[table].push(full);
         return full;
+    }
+
+    // A stored post: one or more rows of one Discord message, with counts.
+    post(table: string, options: {messageId: string, userId?: string|null, files?: number, reactions?: number|null, flashes?: number|null, createdAt?: string|null, channelId?: string}): FakeRow[] {
+        const rows: FakeRow[] = [];
+        for(let i = 0; i < (options.files ?? 1); i++) {
+            rows.push(this.add(table, {
+                url: `https://cdn.discordapp.com/attachments/${options.channelId ?? HOMIES_CHANNEL}/${options.messageId}${i}/f${i}.png`,
+                guildId: GUILD, userId: options.userId === undefined ? USER : options.userId, createdAt: options.createdAt ?? "2024-05-01 10:00:00",
+                channelId: options.channelId ?? HOMIES_CHANNEL, messageId: options.messageId,
+                reactionCount: options.reactions ?? null, flashCount: options.flashes ?? null,
+                reactionsCheckedAt: options.reactions === undefined || options.reactions === null ? null : "2026-09-01 00:00:00"
+            }));
+        }
+        return rows;
     }
 
     private table(name: string): FakeRow[] {
@@ -113,6 +131,52 @@ export class FakeDb {
         }
         if((m = /^SELECT COUNT\(\*\) AS total FROM (\w+) WHERE guildId = \? AND messageId = \?$/.exec(sql))) {
             return [{total: BigInt(this.table(m[1]).filter(r => r.guildId === params[0] && r.messageId === params[1]).length)}];
+        }
+        // The leaderboards. Each statement is one table; the API merges them.
+        if((m = /^SELECT userId, COUNT\(\*\) AS score FROM (\w+) WHERE guildId = \? AND userId IS NOT NULL GROUP BY userId$/.exec(sql))) {
+            const scores = new Map<string, number>();
+            for(const r of this.table(m[1])) if(r.guildId === params[0] && r.userId !== null) scores.set(r.userId, (scores.get(r.userId) || 0) + 1);
+            return [...scores].map(([userId, score]) => ({userId, score: BigInt(score)}));
+        }
+        if((m = /^SELECT userId, SUM\(reactions\) AS score FROM \(SELECT messageId, MIN\(userId\) AS userId, MAX\(reactionCount\) AS reactions FROM (\w+) WHERE guildId = \? AND userId IS NOT NULL AND messageId IS NOT NULL AND reactionCount IS NOT NULL GROUP BY messageId\) posts GROUP BY userId$/.exec(sql))) {
+            const posts = new Map<string, {userId: string, reactions: number}>();
+            for(const r of this.table(m[1])) {
+                if(r.guildId !== params[0] || r.userId === null || r.messageId === null || r.reactionCount === null || r.reactionCount === undefined) continue;
+                const post = posts.get(r.messageId);
+                if(!post) posts.set(r.messageId, {userId: r.userId, reactions: r.reactionCount});
+                else { post.userId = post.userId < r.userId ? post.userId : r.userId; post.reactions = Math.max(post.reactions, r.reactionCount); }
+            }
+            const scores = new Map<string, number>();
+            for(const post of posts.values()) scores.set(post.userId, (scores.get(post.userId) || 0) + post.reactions);
+            // The real driver returns a DECIMAL sum as a string.
+            return [...scores].map(([userId, score]) => ({userId, score: String(score)}));
+        }
+        if((m = /^SELECT id, url, createdAt, source, channelId, messageId, userId, (reactionCount|flashCount) AS score, mediaCount FROM \(SELECT CAST\(id AS CHAR\) AS id, url, DATE_FORMAT\(createdAt, '%Y-%m-%dT%H:%i:%sZ'\) AS createdAt, source, channelId, messageId, userId, \1, ROW_NUMBER\(\) OVER \(PARTITION BY messageId ORDER BY id\) AS place, COUNT\(\*\) OVER \(PARTITION BY messageId\) AS mediaCount FROM (\w+) WHERE guildId = \? AND messageId IS NOT NULL AND \1 > 0\) ranked WHERE place = 1 ORDER BY score DESC, createdAt DESC, id DESC LIMIT \?$/.exec(sql))) {
+            const column = m[1] as "reactionCount"|"flashCount";
+            const rows = this.table(m[2]).filter(r => r.guildId === params[0] && r.messageId !== null && (r[column] ?? 0) > 0);
+            const byMessage = new Map<string, FakeRow[]>();
+            for(const r of rows) byMessage.set(r.messageId!, [...(byMessage.get(r.messageId!) || []), r]);
+            const firsts = [...byMessage.values()].map(group => {
+                const sorted = [...group].sort((a, b) => a.id < b.id ? -1 : 1);
+                return {row: sorted[0], mediaCount: group.length};
+            });
+            firsts.sort((a, b) => (b.row[column]! - a.row[column]!) || compareNewestFirst(a.row, b.row));
+            return firsts.slice(0, params[1] as number).map(({row, mediaCount}) => ({...FakeDb.project(row), score: row[column], mediaCount: BigInt(mediaCount)}));
+        }
+        if((m = /^SELECT COUNT\(DISTINCT messageId\) AS total, COUNT\(DISTINCT CASE WHEN reactionsCheckedAt IS NOT NULL THEN messageId END\) AS counted FROM (\w+) WHERE guildId = \? AND messageId IS NOT NULL$/.exec(sql))) {
+            const rows = this.table(m[1]).filter(r => r.guildId === params[0] && r.messageId !== null);
+            return [{total: BigInt(new Set(rows.map(r => r.messageId)).size), counted: BigInt(new Set(rows.filter(r => r.reactionsCheckedAt).map(r => r.messageId)).size)}];
+        }
+        // The reaction recounter's writes.
+        if((m = /^UPDATE (\w+) SET reactionCount = \?, flashCount = \?, reactionsCheckedAt = UTC_TIMESTAMP\(\) WHERE guildId = \? AND messageId = \?$/.exec(sql))) {
+            const hit = this.table(m[1]).filter(r => r.guildId === params[2] && r.messageId === params[3]);
+            for(const r of hit) { r.reactionCount = params[0] as number; r.flashCount = params[1] as number; r.reactionsCheckedAt = new Date(this.clock()).toISOString().slice(0, 19).replace("T", " "); }
+            return {affectedRows: hit.length};
+        }
+        if((m = /^UPDATE (\w+) SET reactionsCheckedAt = UTC_TIMESTAMP\(\) WHERE guildId = \? AND messageId = \?$/.exec(sql))) {
+            const hit = this.table(m[1]).filter(r => r.guildId === params[0] && r.messageId === params[1]);
+            for(const r of hit) r.reactionsCheckedAt = new Date(this.clock()).toISOString().slice(0, 19).replace("T", " ");
+            return {affectedRows: hit.length};
         }
         if((m = /^SELECT userId, channelId, messageId FROM (\w+) WHERE id = CAST\(\? AS UNSIGNED\) AND guildId = \?$/.exec(sql))) {
             return this.table(m[1]).filter(r => r.id === BigInt(params[0] as string) && r.guildId === params[1]).map(r => ({userId: r.userId, channelId: r.channelId, messageId: r.messageId}));

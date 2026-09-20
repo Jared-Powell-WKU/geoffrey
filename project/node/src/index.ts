@@ -9,6 +9,7 @@ import { GuildDictionary, query, transaction } from './util/util';
 import { startHealthHeartbeat } from './util/health';
 import { startInternalApi } from './internalApi';
 import { startOriginBackfill } from './maintenance/backfillOrigins';
+import { startReactionCounts } from './maintenance/reactionCounts';
 
 const client = new Client({
     intents:[GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.GuildMessageReactions],
@@ -46,12 +47,21 @@ client.once(Events.ClientReady, (c: Client)=> {
 })
 client.login(process.env.CLIENT_TOKEN);
 startInternalApi({client, query, transaction});
+// Keeps the reaction counts of stored posts current for the site's leaderboards:
+// the events below feed it, and its own job counts the backlog.
+const reactionCounts = startReactionCounts({client, query, guilds: JSON.parse(process.env.GUILDS || '{}')});
 
 client.on(Events.InteractionCreate, interactionHandler);
 client.on(Events.MessageCreate, saveAttachmentsFromMessage);
 client.on(Events.MessageDelete, deleteSubmissionsOfDeletedMessage);
 client.on(Events.MessageBulkDelete, deleteSubmissionsOfDeletedMessages);
-client.on(Events.MessageReactionAdd, async(reaction: MessageReaction|PartialMessageReaction, user: User|PartialUser)=>{return await checkForImageDeletion(reaction, user, client)})
+client.on(Events.MessageReactionAdd, async(reaction: MessageReaction|PartialMessageReaction, user: User|PartialUser)=>{
+    reactionCounts?.recounter.noticed(reaction.message);
+    return await checkForImageDeletion(reaction, user, client);
+});
+client.on(Events.MessageReactionRemove, (reaction) => { reactionCounts?.recounter.noticed(reaction.message); });
+client.on(Events.MessageReactionRemoveAll, (message) => { reactionCounts?.recounter.noticed(message); });
+client.on(Events.MessageReactionRemoveEmoji, (reaction) => { reactionCounts?.recounter.noticed(reaction.message); });
 
 let portsAvailable: boolean = false;
 

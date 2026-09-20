@@ -2,7 +2,7 @@ import { test, describe, beforeEach, afterEach } from "node:test";
 import * as assert from "node:assert/strict";
 import * as http from "node:http";
 import * as net from "node:net";
-import { createInternalApi, createDiscordFacade, decodeCursor, encodeCursor, MAX_USER_FETCHES, messageUrlOf, parseCdnExpiry, parseOwnerUserId, startInternalApi, validateSubmissionUrl } from "../internalApi";
+import { createInternalApi, createDiscordFacade, decodeCursor, encodeCursor, MAX_USER_FETCHES, messageUrlOf, parseCdnExpiry, parseOwnerUserId, rankOf, startInternalApi, validateSubmissionUrl } from "../internalApi";
 import { formatWebAddNotice, getStoredUrlFromContent } from "../util/storedUrl";
 import { getTableByCommandName } from "../util/tables";
 import { compareNewestFirst, createHarness, FakeDb, FakeDiscord, GUILD, GUILDS, Harness, HOMIES_CHANNEL, KEY, MOD_USER, OTHER_GUILD, OTHER_USER, OWNER, USER } from "./helpers";
@@ -576,6 +576,138 @@ describe("pool", () => {
         const res = await h.request("GET", pool(`userId=${USER}&category=homies`));
         assert.match(res.body.items[0].displayUrl, /^https:\/\/cdn\.discordapp\.com\/attachments\/1\/2\/a\.png\?ex=/);
         assert.equal(res.body.items[0].url, stored);
+    });
+});
+
+describe("leaderboards", () => {
+    const board = (query: string, guildId: string = GUILD) => `/v1/guilds/${guildId}/leaderboard?${query}`;
+    const FLASH = "\u{1F4F8}";
+
+    // Two people's posts in GUILD, counted and not, in both tables, plus rows
+    // that no board may count: no poster, another guild, added on the site.
+    function seed(db: FakeDb) {
+        const a = db.post("homies", {messageId: "400000000000000001", files: 2, reactions: 5, flashes: 4, createdAt: "2024-05-01 10:00:00"});
+        const b = db.post("homies", {messageId: "400000000000000002", reactions: 2, flashes: 0, createdAt: "2024-05-02 10:00:00"});
+        const c = db.post("homies", {messageId: "400000000000000003", userId: OTHER_USER, reactions: 10, flashes: 1, createdAt: "2024-05-03 10:00:00"});
+        const d = db.post("homies", {messageId: "400000000000000004", userId: OTHER_USER, createdAt: "2024-05-04 10:00:00"}); // not counted yet
+        const e = db.post("pets", {messageId: "400000000000000005", reactions: 0, flashes: 0, channelId: "300000000000000002"});
+        const f = db.post("pets", {messageId: "400000000000000006", userId: MOD_USER, reactions: 10, flashes: 4, createdAt: "2024-05-06 10:00:00", channelId: "300000000000000002"});
+        db.add("homies", {url: "https://example.com/web.png", source: "web", createdAt: "2024-05-07 10:00:00"});
+        db.add("homies", {url: "https://example.com/nobody.png", userId: null});
+        db.add("homies", {url: "https://example.com/elsewhere.png", guildId: OTHER_GUILD});
+        db.add("pets", {url: "https://example.com/elsewhere-pet.png", guildId: OTHER_GUILD, userId: OTHER_USER});
+        return {a, b, c, d, e, f};
+    }
+
+    test("board, category, limit and userId are validated before any SQL or Discord call", async () => {
+        for(const query of [
+            "userId=" + USER, "board=users-by-submissions", `userId=${USER}&board=top`, `userId=${USER}&board=`, `userId=${USER}&board=toString`,
+            `userId=${USER}&board=users-by-submissions&category=cute`, `userId=${USER}&board=users-by-submissions&category=`, `userId=${USER}&board=users-by-submissions&category=ALL`,
+            `userId=${USER}&board=posts-by-flashes&limit=0`, `userId=${USER}&board=posts-by-flashes&limit=101`, `userId=${USER}&board=posts-by-flashes&limit=abc`, `userId=${USER}&board=posts-by-flashes&limit=050`, `userId=${USER}&board=posts-by-flashes&limit=-1`,
+            `userId=12&board=users-by-submissions`
+        ]) {
+            const res = await h.request("GET", board(query));
+            assert.equal(res.status, 400, query);
+            assert.equal(res.body.error.code, "INVALID_REQUEST");
+        }
+        assert.equal(h.db.statements.length, 0);
+        assert.equal(h.discord.memberLookups.length, 0);
+        assert.equal((await h.request("POST", board(`userId=${USER}&board=users-by-submissions`))).status, 404);
+        assert.equal((await h.request("GET", board(`userId=${USER}&board=users-by-submissions`, "999999999999999999"))).status, 404);
+        assert.equal((await h.request("GET", board(`userId=200000000000000009&board=users-by-submissions`))).status, 403);
+        assert.equal(h.db.statements.length, 0);
+        h.discord.ready = false;
+        assert.equal((await h.request("GET", board(`userId=${USER}&board=users-by-submissions`))).status, 503);
+    });
+
+    test("users by submissions: one entry per poster, both tables added up, ties sharing a rank, no user id in the answer", async () => {
+        seed(h.db);
+        h.discord.guildProfiles.set(`${GUILD}:${USER}`, {name: "Me", avatarUrl: "https://cdn.discordapp.com/a.png"});
+        h.discord.globalProfiles.set(OTHER_USER, {name: "Other", avatarUrl: null});
+        const res = await h.request("GET", board(`userId=${USER}&board=users-by-submissions`));
+        assert.equal(res.status, 200);
+        assert.deepEqual(res.body, {
+            board: "users-by-submissions", category: "all", coverage: null,
+            entries: [
+                {rank: 1, poster: {name: "Me", avatarUrl: "https://cdn.discordapp.com/a.png"}, mine: true, score: 5},
+                {rank: 2, poster: {name: "Other", avatarUrl: null}, mine: false, score: 2},
+                {rank: 3, poster: {name: null, avatarUrl: null}, mine: false, score: 1}
+            ]
+        });
+        assert.ok(!JSON.stringify(res.body).includes(USER) && !JSON.stringify(res.body).includes(OTHER_USER) && !JSON.stringify(res.body).includes(MOD_USER));
+        // One category, and the other person's view of it.
+        const pets = await h.request("GET", board(`userId=${OTHER_USER}&board=users-by-submissions&category=pets`));
+        assert.deepEqual(pets.body.entries.map((e: any) => [e.rank, e.score, e.mine]), [[1, 1, false], [1, 1, false]]);
+        assert.equal(pets.body.category, "pets");
+        const homies = await h.request("GET", board(`userId=${OTHER_USER}&board=users-by-submissions&category=homies&limit=1`));
+        assert.deepEqual(homies.body.entries.map((e: any) => [e.rank, e.score, e.mine]), [[1, 4, false]]);
+        // A tie: two more homies rows for OTHER_USER make it 4 and 4.
+        h.db.post("homies", {messageId: "400000000000000009", userId: OTHER_USER, files: 2});
+        const tied = await h.request("GET", board(`userId=${OTHER_USER}&board=users-by-submissions&category=homies`));
+        assert.deepEqual(tied.body.entries.map((e: any) => [e.rank, e.score, e.mine]), [[1, 4, false], [1, 4, true]]);
+    });
+
+    test("users by reactions: a post's reactions count once however many files it has, uncounted posts are left out, and coverage says so", async () => {
+        seed(h.db);
+        const res = await h.request("GET", board(`userId=${USER}&board=users-by-reactions`));
+        assert.equal(res.status, 200);
+        assert.deepEqual(res.body.entries.map((e: any) => [e.rank, e.score, e.mine]), [[1, 10, false], [1, 10, false], [3, 7, true]]);
+        // Six posts have a message (a to f); d is not counted yet.
+        assert.deepEqual(res.body.coverage, {counted: 5, total: 6});
+        const homies = await h.request("GET", board(`userId=${USER}&board=users-by-reactions&category=homies`));
+        assert.deepEqual(homies.body.entries.map((e: any) => [e.rank, e.score, e.mine]), [[1, 10, false], [2, 7, true]]);
+        assert.deepEqual(homies.body.coverage, {counted: 3, total: 4});
+    });
+
+    test("posts by reactions and by flashes: one entry per post with its first file, its file count, the viewer's rights, and fresh display URLs", async () => {
+        const {a, c, f} = seed(h.db);
+        h.discord.guildProfiles.set(`${GUILD}:${OTHER_USER}`, {name: "Other", avatarUrl: null});
+        const res = await h.request("GET", board(`userId=${USER}&board=posts-by-reactions`));
+        assert.equal(res.status, 200);
+        assert.equal(res.body.board, "posts-by-reactions");
+        assert.deepEqual(res.body.coverage, {counted: 5, total: 6});
+        assert.deepEqual(res.body.entries.map((e: any) => [e.rank, e.score, e.mediaCount, e.item.id, e.item.category]), [
+            [1, 10, 1, String(f[0].id), "pets"],   // newer of the two tens first
+            [1, 10, 1, String(c[0].id), "homies"],
+            [3, 5, 2, String(a[0].id), "homies"],
+            [4, 2, 1, "3", "homies"]
+        ]);
+        const first = res.body.entries[2].item;
+        assert.deepEqual(first, {
+            id: String(a[0].id), category: "homies", url: a[0].url,
+            displayUrl: `${a[0].url.split("?")[0]}?ex=${h.discord.refreshedExpiry.toString(16)}&is=1&hm=abc&`,
+            createdAt: "2024-05-01T10:00:00Z", source: "discord",
+            messageUrl: `https://discord.com/channels/${GUILD}/${HOMIES_CHANNEL}/400000000000000001`,
+            poster: {name: null, avatarUrl: null}, mine: true, canDelete: true
+        });
+        assert.deepEqual([res.body.entries[1].item.poster, res.body.entries[1].item.mine, res.body.entries[1].item.canDelete], [{name: "Other", avatarUrl: null}, false, false]);
+        assert.ok(!JSON.stringify(res.body).includes(USER) && !JSON.stringify(res.body).includes(OTHER_USER));
+        // A moderator may remove any of them.
+        const asMod = await h.request("GET", board(`userId=${MOD_USER}&board=posts-by-reactions&limit=2`));
+        assert.deepEqual(asMod.body.entries.map((e: any) => [e.item.mine, e.item.canDelete]), [[true, true], [false, true]]);
+        // Flashes: the camera-flash count, posts without one left out.
+        const flashes = await h.request("GET", board(`userId=${USER}&board=posts-by-flashes`));
+        assert.deepEqual(flashes.body.entries.map((e: any) => [e.rank, e.score, e.item.id]), [[1, 4, String(f[0].id)], [1, 4, String(a[0].id)], [3, 1, String(c[0].id)]]);
+        const petsOnly = await h.request("GET", board(`userId=${USER}&board=posts-by-flashes&category=pets`));
+        assert.deepEqual(petsOnly.body.entries.map((e: any) => e.item.id), [String(f[0].id)]);
+        assert.deepEqual(petsOnly.body.coverage, {counted: 2, total: 2});
+        assert.equal(FLASH, "\u{1F4F8}");
+    });
+
+    test("an empty collection is an empty board", async () => {
+        for(const name of ["users-by-submissions", "users-by-reactions", "posts-by-reactions", "posts-by-flashes"]) {
+            const res = await h.request("GET", board(`userId=${USER}&board=${name}`));
+            assert.equal(res.status, 200, name);
+            assert.deepEqual(res.body.entries, []);
+            assert.deepEqual(res.body.coverage, name === "users-by-submissions" ? null : {counted: 0, total: 0});
+        }
+        assert.equal(h.discord.refreshCalls.length, 0);
+    });
+
+    test("ranks", () => {
+        assert.deepEqual(rankOf([5, 5, 3, 3, 3, 1], s => s), [1, 1, 3, 3, 3, 6]);
+        assert.deepEqual(rankOf([], s => s), []);
+        assert.deepEqual(rankOf([1], s => s), [1]);
     });
 });
 

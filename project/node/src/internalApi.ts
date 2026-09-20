@@ -11,11 +11,16 @@ import type { GuildDictionary, SupportedGuild } from "./util/util";
 
 export type Category = "homies" | "pets";
 const CATEGORIES: readonly Category[] = ["homies", "pets"];
+export type LeaderboardBoard = "users-by-submissions" | "users-by-reactions" | "posts-by-reactions" | "posts-by-flashes";
+const BOARDS: readonly LeaderboardBoard[] = ["users-by-submissions", "users-by-reactions", "posts-by-reactions", "posts-by-flashes"];
+export type LeaderboardCategory = Category | "all";
 
 export const MIN_KEY_LENGTH = 32;
 export const DEFAULT_PORT = 8787;
 export const MAX_BODY_BYTES = 8 * 1024;
 export const MAX_LIMIT = 48;
+export const DEFAULT_LEADERBOARD_LIMIT = 50;
+export const MAX_LEADERBOARD_LIMIT = 100;
 export const MAX_URL_LENGTH = 1024;
 export const REFRESH_BATCH_SIZE = 50;
 const ACCESS_TTL_MS = 60_000;
@@ -113,6 +118,52 @@ interface PoolItem extends Submission {
 interface Access {
     member: boolean,
     moderator: boolean
+}
+
+interface LeaderboardUserEntry {
+    rank: number,
+    poster: Poster,
+    mine: boolean,
+    score: number
+}
+
+interface LeaderboardPostEntry {
+    rank: number,
+    item: PoolItem,
+    mediaCount: number,
+    score: number
+}
+
+// A post board's row before it becomes an item: the row's columns plus its score.
+interface ScoredRow {
+    category: Category,
+    row: any,
+    score: number,
+    mediaCount: number
+}
+
+// The listings' order, for rows as the SUBMISSION_COLUMNS select returns them:
+// newest first, unknown dates last, then the larger id first.
+export function compareRowsNewestFirst(a: {createdAt: unknown, id: unknown}, b: {createdAt: unknown, id: unknown}): number {
+    const aDate = typeof a.createdAt === "string" ? a.createdAt : null;
+    const bDate = typeof b.createdAt === "string" ? b.createdAt : null;
+    if(aDate !== bDate) {
+        if(aDate === null) return 1;
+        if(bDate === null) return -1;
+        return aDate < bDate ? 1 : -1;
+    }
+    const aId = BigInt(String(a.id)), bId = BigInt(String(b.id));
+    return aId === bId ? 0 : aId < bId ? 1 : -1;
+}
+
+// Equal scores share a rank and the rank after a tie skips (1, 1, 3). The
+// entries must already be in score order.
+export function rankOf<T>(entries: T[], scoreOf: (entry: T) => number): number[] {
+    const ranks: number[] = [];
+    entries.forEach((entry, index) => {
+        ranks.push(index > 0 && scoreOf(entries[index - 1]) === scoreOf(entry) ? ranks[index - 1] : index + 1);
+    });
+    return ranks;
 }
 
 // Null for an unset value. An invalid one is reported as such so the caller can warn.
@@ -263,6 +314,28 @@ export function createInternalApi(deps: InternalApiDeps): http.Server {
         return value;
     }
 
+    function parseBoard(value: unknown): LeaderboardBoard {
+        if(typeof value !== "string" || !BOARDS.includes(value as LeaderboardBoard)) {
+            throw invalid(`board must be one of ${BOARDS.join(", ")}.`);
+        }
+        return value as LeaderboardBoard;
+    }
+
+    // The tables a leaderboard reads: one category, or both for "all".
+    function parseLeaderboardCategory(value: unknown): {category: LeaderboardCategory, categories: Category[]} {
+        if(value === null || value === "all") return {category: "all", categories: [...CATEGORIES]};
+        const category = parseCategory(value);
+        return {category, categories: [category]};
+    }
+
+    function parseLimit(value: string|null, fallback: number, max: number): number {
+        if(value === null) return fallback;
+        if(!/^[1-9][0-9]{0,2}$/.test(value)) throw invalid(`limit must be between 1 and ${max}.`);
+        const limit = parseInt(value, 10);
+        if(limit < 1 || limit > max) throw invalid(`limit must be between 1 and ${max}.`);
+        return limit;
+    }
+
     // Membership and moderator status come from the same answer and are cached
     // together. A moderator holds the role named adminRoleName, the rule
     // checkForImageDeletion in events.ts applies to reactions.
@@ -398,13 +471,7 @@ export function createInternalApi(deps: InternalApiDeps): http.Server {
     async function listPage(guildId: string, params: URLSearchParams, scope: "own"|"pool") {
         const userId = parseDiscordId(params.get("userId"), "userId");
         const category = parseCategory(params.get("category"));
-        let limit = MAX_LIMIT;
-        const rawLimit = params.get("limit");
-        if(rawLimit !== null) {
-            if(!/^[0-9]{1,2}$/.test(rawLimit)) throw invalid(`limit must be between 1 and ${MAX_LIMIT}.`);
-            limit = parseInt(rawLimit, 10);
-            if(limit < 1 || limit > MAX_LIMIT) throw invalid(`limit must be between 1 and ${MAX_LIMIT}.`);
-        }
+        const limit = parseLimit(params.get("limit"), MAX_LIMIT, MAX_LIMIT);
         let cursor: {createdAt: string|null, id: string}|null = null;
         const rawCursor = params.get("cursor");
         if(rawCursor !== null) {
@@ -461,6 +528,98 @@ export function createInternalApi(deps: InternalApiDeps): http.Server {
             };
         });
         return {items: poolItems, nextCursor, total};
+    }
+
+    // A ranking of the guild's collection. Every board reads whole tables (a
+    // guild has a few thousand rows), so there is no cursor: the top entries
+    // are the answer. Rows reach a response only as PoolItems and Posters.
+    async function getLeaderboard(guildId: string, params: URLSearchParams) {
+        const userId = parseDiscordId(params.get("userId"), "userId");
+        const board = parseBoard(params.get("board"));
+        const {category, categories} = parseLeaderboardCategory(params.get("category"));
+        const limit = parseLimit(params.get("limit"), DEFAULT_LEADERBOARD_LIMIT, MAX_LEADERBOARD_LIMIT);
+        const {guild} = getGuild(guildId);
+        const access = await requireMember(guild, userId);
+        const posterOf = (value: unknown): string|null => typeof value === "string" && DISCORD_ID.test(value) ? value : null;
+
+        if(board === "users-by-submissions" || board === "users-by-reactions") {
+            // Per table, then added up per poster across the tables.
+            const scores = new Map<string, number>();
+            for(const tableCategory of categories) {
+                const table = tableFor(tableCategory);
+                // Reactions belong to a post (a message), and a message with three
+                // stored files must count its reactions once, so the rows are folded
+                // by message first. A message's rows all carry the same counts.
+                const rows: any[] = board === "users-by-submissions"
+                    ? await query(`SELECT userId, COUNT(*) AS score FROM ${table} WHERE guildId = ? AND userId IS NOT NULL GROUP BY userId`, [guildId])
+                    : await query(`SELECT userId, SUM(reactions) AS score FROM (SELECT messageId, MIN(userId) AS userId, MAX(reactionCount) AS reactions FROM ${table} WHERE guildId = ? AND userId IS NOT NULL AND messageId IS NOT NULL AND reactionCount IS NOT NULL GROUP BY messageId) posts GROUP BY userId`, [guildId]);
+                for(const row of rows) {
+                    const posterId = posterOf(row.userId);
+                    if(posterId === null) continue;
+                    scores.set(posterId, (scores.get(posterId) || 0) + Number(row.score ?? 0));
+                }
+            }
+            const top = [...scores.entries()]
+                .filter(([, score]) => score > 0)
+                .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1))
+                .slice(0, limit);
+            const posters = await resolvePosters(guildId, top.map(([posterId]) => posterId));
+            const ranks = rankOf(top, ([, score]) => score);
+            const entries: LeaderboardUserEntry[] = top.map(([posterId, score], index) => ({
+                rank: ranks[index],
+                poster: posters.get(posterId) || {name: null, avatarUrl: null},
+                mine: posterId === userId,
+                score
+            }));
+            return {board, category, entries, coverage: board === "users-by-reactions" ? await reactionCoverage(guildId, categories) : null};
+        }
+
+        const scoreColumn = board === "posts-by-reactions" ? "reactionCount" : "flashCount";
+        const scored: ScoredRow[] = [];
+        for(const tableCategory of categories) {
+            const table = tableFor(tableCategory);
+            // One entry per message: its first stored file stands for the post, and
+            // mediaCount says how many files of it are stored. A table's top rows
+            // are enough, because the merged top cannot reach past them.
+            const rows: any[] = await query(`SELECT id, url, createdAt, source, channelId, messageId, userId, ${scoreColumn} AS score, mediaCount FROM (SELECT ${SUBMISSION_COLUMNS}, ${scoreColumn}, ROW_NUMBER() OVER (PARTITION BY messageId ORDER BY id) AS place, COUNT(*) OVER (PARTITION BY messageId) AS mediaCount FROM ${table} WHERE guildId = ? AND messageId IS NOT NULL AND ${scoreColumn} > 0) ranked WHERE place = 1 ORDER BY score DESC, createdAt DESC, id DESC LIMIT ?`, [guildId, limit]);
+            for(const row of rows) {
+                scored.push({category: tableCategory, row, score: Number(row.score ?? 0), mediaCount: Math.max(1, Number(row.mediaCount ?? 1))});
+            }
+        }
+        const top = scored
+            .sort((a, b) => b.score - a.score || compareRowsNewestFirst(a.row, b.row))
+            .slice(0, limit);
+        const posters = await resolvePosters(guildId, top.map(entry => posterOf(entry.row.userId)).filter((id): id is string => id !== null));
+        const ranks = rankOf(top, entry => entry.score);
+        const entries: LeaderboardPostEntry[] = [];
+        // toSubmissions refreshes display URLs in batches, so one call per category.
+        for(const tableCategory of categories) {
+            const ofCategory = top.filter(entry => entry.category === tableCategory);
+            const items = await toSubmissions(ofCategory.map(entry => entry.row), tableCategory, guildId);
+            ofCategory.forEach((entry, index) => {
+                const posterId = posterOf(entry.row.userId);
+                const mine = posterId !== null && posterId === userId;
+                entries[top.indexOf(entry)] = {
+                    rank: ranks[top.indexOf(entry)],
+                    item: {...items[index], poster: (posterId !== null && posters.get(posterId)) || {name: null, avatarUrl: null}, mine, canDelete: mine || access.moderator},
+                    mediaCount: entry.mediaCount,
+                    score: entry.score
+                };
+            });
+        }
+        return {board, category, entries, coverage: await reactionCoverage(guildId, categories)};
+    }
+
+    // How far the reaction count has got: posts counted, of posts that have a
+    // message to count. Rows added on the site have none and are left out.
+    async function reactionCoverage(guildId: string, categories: Category[]): Promise<{counted: number, total: number}> {
+        const coverage = {counted: 0, total: 0};
+        for(const category of categories) {
+            const rows: any[] = await query(`SELECT COUNT(DISTINCT messageId) AS total, COUNT(DISTINCT CASE WHEN reactionsCheckedAt IS NOT NULL THEN messageId END) AS counted FROM ${tableFor(category)} WHERE guildId = ? AND messageId IS NOT NULL`, [guildId]);
+            coverage.total += Number(rows?.[0]?.total ?? 0);
+            coverage.counted += Number(rows?.[0]?.counted ?? 0);
+        }
+        return coverage;
     }
 
     async function addSubmission(guildId: string, body: unknown) {
@@ -613,6 +772,11 @@ export function createInternalApi(deps: InternalApiDeps): http.Server {
             const guildId = parseDiscordId(segments[2], "guildId");
             if(!discord.isReady()) throw notReady();
             return {status: 200, body: await listPool(guildId, url.searchParams)};
+        }
+        if(segments.length === 4 && segments[1] === "guilds" && segments[3] === "leaderboard" && method === "GET") {
+            const guildId = parseDiscordId(segments[2], "guildId");
+            if(!discord.isReady()) throw notReady();
+            return {status: 200, body: await getLeaderboard(guildId, url.searchParams)};
         }
         if(segments[1] === "guilds" && segments[3] === "submissions") {
             if(segments.length === 4 && method === "GET") {

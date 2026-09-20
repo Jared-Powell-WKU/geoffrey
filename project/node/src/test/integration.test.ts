@@ -9,6 +9,7 @@ import { mediaKey, QueryFn, removalSql, removeImageByUrl, removeImagesForMessage
 import { createDbAccess } from "../util/dbAccess";
 import { insertAttachmentsSql } from "../util/submissionSql";
 import { backfillOrigins } from "../maintenance/backfillOrigins";
+import { countPendingReactions, recordReactionCounts } from "../maintenance/reactionCounts";
 import { FakeDiscord, GUILDS, GUILD, KEY, listen, makeRequester, MEDIA_KEY_CASES, MOD_USER, OTHER_USER, OWN_KEY_CASES, OWNER, USER } from "./helpers";
 
 const {TEST_DB_PORT, TEST_DB_HOST, TEST_DB_USER, TEST_DB_PASSWORD, TEST_DB_NAME} = process.env;
@@ -228,6 +229,115 @@ describe("internal API against MariaDB", {skip: TEST_DB_PORT ? false : "TEST_DB_
         const again = await backfillOrigins({query, fetchAround: async () => { throw new Error("nothing should be pending"); }, sleep: async () => {}}, {maxLookups: 10, scanLimit: 100_000, intervalMs: 0});
         assert.deepEqual([again.pending, again.lookups, again.stopped], [0, 0, null]);
         for(const table of ["homies", "pets"]) await query(`DELETE FROM ${table} WHERE guildId = ?`, [BG]);
+    });
+
+    test("reaction counts are written to their three columns only, and the leaderboards read them with the real SQL", async () => {
+        const LG = "100000000000000999";
+        const channel = "300000000000000099";
+        const cdnOf = (n: number) => `https://cdn.discordapp.com/attachments/${channel}/${1600000000000000000n + BigInt(n)}/pic_${n}.png`;
+        const message = (n: number) => String(1700000000000000000n + BigInt(n));
+        for(const table of ["homies", "pets"]) await query(`DELETE FROM ${table} WHERE guildId = ?`, [LG]);
+        // USER: message 1 with two files, message 2; OTHER_USER: message 3, message 4; a poster-less message 5;
+        // a pets post 6 by MOD_USER; a web row; a row that never found its message.
+        const post = (table: string, n: number, messageId: string|null, userId: string|null, createdAt: string) => query(`INSERT INTO ${table} (url, guildId, userId, channelId, messageId, createdAt) VALUES (?,?,?,?,?,?)`, [cdnOf(n), LG, userId, messageId ? channel : null, messageId, createdAt]);
+        await post("homies", 1, message(1), USER, "2024-01-01 00:00:00");
+        await post("homies", 2, message(1), USER, "2024-01-01 00:00:00");
+        await post("homies", 3, message(2), USER, "2024-01-02 00:00:00");
+        await post("homies", 4, message(3), OTHER_USER, "2024-01-03 00:00:00");
+        await post("homies", 5, message(4), OTHER_USER, "2024-01-04 00:00:00");
+        await post("homies", 6, message(5), null, "2024-01-05 00:00:00");
+        await post("pets", 7, message(6), MOD_USER, "2024-01-06 00:00:00");
+        await query("INSERT INTO homies (url, guildId, userId, createdAt, source) VALUES (?,?,?,UTC_TIMESTAMP(),'web')", ["https://example.com/integration/leaderboard-web.png", LG, USER]);
+        await post("homies", 9, null, USER, "2024-01-09 00:00:00");
+        const snapshot = async () => (await query("SELECT 'homies' AS t, CAST(id AS CHAR) AS id, url, guildId, userId, DATE_FORMAT(createdAt, '%Y-%m-%d %H:%i:%s') AS createdAt, source, channelId, messageId, originCheckedAt, mediaKey FROM homies WHERE guildId = ? UNION ALL SELECT 'pets', CAST(id AS CHAR), url, guildId, userId, DATE_FORMAT(createdAt, '%Y-%m-%d %H:%i:%s'), source, channelId, messageId, originCheckedAt, mediaKey FROM pets WHERE guildId = ? ORDER BY 1, 2", [LG, LG]) as any[]).map(r => ({...r}));
+        const before = await snapshot();
+        assert.equal(before.length, 9);
+
+        // An API that knows this guild, with USER and OTHER_USER as members.
+        const configured = {...GUILDS, lg: {guildId: LG, adminRoleName: "Mods", channels: {homies: [channel], pets: []}}};
+        const scoped = createInternalApi({config: {key: KEY, guilds: configured, ownerUserId: OWNER}, query, transaction, discord, log: {info: () => {}, warn: () => {}, error: console.error}});
+        const scopedRequest = makeRequester(await listen(scoped));
+        discord.members.add(`${LG}:${USER}`);
+        discord.members.add(`${LG}:${OTHER_USER}`);
+        discord.knownGuilds[LG] = {name: "LG", iconUrl: null};
+        try {
+            const boardOf = (name: string, extra = "") => scopedRequest("GET", `/v1/guilds/${LG}/leaderboard?userId=${USER}&board=${name}${extra}`);
+            // Nothing is counted yet: only the submissions board has entries.
+            let res = await boardOf("users-by-submissions");
+            assert.equal(res.status, 200, JSON.stringify(res.body));
+            assert.deepEqual(res.body.entries.map((e: any) => [e.rank, e.score, e.mine]), [[1, 5, true], [2, 2, false], [3, 1, false]]);
+            assert.deepEqual((await boardOf("users-by-reactions")).body, {board: "users-by-reactions", category: "all", entries: [], coverage: {counted: 0, total: 6}});
+            assert.deepEqual((await boardOf("posts-by-reactions")).body.entries, []);
+
+            // The job counts them: message 4 is gone, the rest have reactions.
+            const reactions: Record<string, any[]> = {
+                [message(1)]: [{count: 4, me: true, emoji: {name: "\u{1F4F8}"}}, {count: 2, me: false, emoji: {name: "x"}}], // 5, flashes 3
+                [message(2)]: [{count: 1, me: true, emoji: {name: "\u{1F4F8}"}}],                                          // 0
+                [message(3)]: [{count: 1, me: true, emoji: {name: "\u{1F4F8}"}}, {count: 7, me: false, emoji: {name: "y"}}], // 7
+                [message(5)]: [{count: 3, me: false, emoji: {name: "\u{1F4F8}"}}],                                         // 3, flashes 3
+                [message(6)]: [{count: 5, me: true, emoji: {name: "\u{1F4F8}"}}]                                           // 4, flashes 4
+            };
+            // The job reads every table, so rows other tests and the migration
+            // rehearsal left behind are looked up too; only this guild's are checked.
+            const fetched: string[] = [];
+            const summary = await countPendingReactions({
+                query,
+                fetchMessage: async (channelId, messageId) => {
+                    if(channelId === channel) fetched.push(messageId);
+                    if(channelId !== channel || !reactions[messageId]) throw Object.assign(new Error("Unknown Message"), {code: 10008, status: 404});
+                    return {id: messageId, reactions: reactions[messageId]};
+                },
+                sleep: async () => {}
+            }, {maxLookups: 10_000, scanLimit: 100_000, intervalMs: 0});
+            assert.equal(summary.stopped, null);
+            assert.deepEqual(fetched.sort(), [1, 2, 3, 4, 5, 6].map(message));
+            assert.ok(summary.counted >= 6 && summary.gone >= 1, JSON.stringify(summary));
+            const counts: any[] = await query("SELECT messageId, reactionCount, flashCount, reactionsCheckedAt IS NOT NULL AS checked, TIMESTAMPDIFF(SECOND, reactionsCheckedAt, UTC_TIMESTAMP()) AS age FROM homies WHERE guildId = ? UNION ALL SELECT messageId, reactionCount, flashCount, reactionsCheckedAt IS NOT NULL, TIMESTAMPDIFF(SECOND, reactionsCheckedAt, UTC_TIMESTAMP()) FROM pets WHERE guildId = ?", [LG, LG]);
+            const of = (messageId: string|null) => counts.filter(r => r.messageId === messageId).map(r => [r.reactionCount, r.flashCount, Number(r.checked)]);
+            assert.deepEqual(of(message(1)), [[5, 3, 1], [5, 3, 1]]);
+            assert.deepEqual(of(message(2)), [[0, 0, 1]]);
+            assert.deepEqual(of(message(3)), [[7, 0, 1]]);
+            assert.deepEqual(of(message(4)), [[null, null, 1]]);
+            assert.deepEqual(of(message(5)), [[3, 3, 1]]);
+            assert.deepEqual(of(message(6)), [[4, 4, 1]]);
+            assert.deepEqual(of(null), [[null, null, 0], [null, null, 0]]);
+            for(const row of counts.filter(r => Number(r.checked))) assert.ok(Number(row.age) >= 0 && Number(row.age) < 120, `age ${row.age}`);
+            // No other column changed, and no row came or went.
+            assert.deepEqual(await snapshot(), before);
+            // A second run finds nothing of this guild to count.
+            const again = await countPendingReactions({query, fetchMessage: async (channelId) => { assert.notEqual(channelId, channel, "nothing of this guild should be pending"); throw Object.assign(new Error("Unknown Message"), {code: 10008}); }, sleep: async () => {}}, {maxLookups: 10_000, scanLimit: 100_000, intervalMs: 0});
+            assert.equal(again.stopped, null);
+            assert.equal(again.counted, 0);
+
+            // The boards, with the real window functions and sums. Scores are JSON numbers.
+            // Coverage counts posts that were checked, the gone one included.
+            res = await boardOf("users-by-reactions");
+            assert.deepEqual(res.body.coverage, {counted: 6, total: 6});
+            assert.deepEqual(res.body.entries.map((e: any) => [e.rank, e.score, e.mine]), [[1, 7, false], [2, 5, true], [3, 4, false]]);
+            assert.equal(typeof res.body.entries[0].score, "number");
+            res = await boardOf("posts-by-reactions");
+            assert.deepEqual(res.body.entries.map((e: any) => [e.rank, e.score, e.mediaCount, e.item.url, e.item.category]), [
+                [1, 7, 1, cdnOf(4), "homies"], [2, 5, 2, cdnOf(1), "homies"], [3, 4, 1, cdnOf(7), "pets"], [4, 3, 1, cdnOf(6), "homies"]
+            ]);
+            assert.equal(typeof res.body.entries[1].mediaCount, "number");
+            assert.deepEqual([res.body.entries[1].item.mine, res.body.entries[1].item.canDelete, res.body.entries[1].item.messageUrl], [true, true, `https://discord.com/channels/${LG}/${channel}/${message(1)}`]);
+            assert.deepEqual([res.body.entries[3].item.poster, res.body.entries[3].item.mine, res.body.entries[3].item.canDelete], [{name: null, avatarUrl: null}, false, false]);
+            res = await boardOf("posts-by-flashes", "&category=homies&limit=2");
+            assert.deepEqual(res.body.entries.map((e: any) => [e.rank, e.score, e.item.url]), [[1, 3, cdnOf(6)], [1, 3, cdnOf(1)]]);
+            assert.deepEqual(res.body.coverage, {counted: 5, total: 5});
+            assert.ok(!JSON.stringify(res.body).includes(USER) && !JSON.stringify(res.body).includes(OTHER_USER) && !JSON.stringify(res.body).includes(MOD_USER));
+
+            // The recounter's write after a reaction event: the same statement, one message.
+            assert.equal(await recordReactionCounts(query, LG, message(2), {reactionCount: 9, flashCount: 1}), 1);
+            res = await boardOf("posts-by-reactions", "&limit=1");
+            assert.deepEqual(res.body.entries.map((e: any) => [e.score, e.item.url]), [[9, cdnOf(3)]]);
+            assert.deepEqual(await snapshot(), before);
+        } finally {
+            scoped.closeAllConnections();
+            await new Promise(resolve => scoped.close(resolve));
+            delete discord.knownGuilds[LG];
+            for(const table of ["homies", "pets"]) await query(`DELETE FROM ${table} WHERE guildId = ?`, [LG]);
+        }
     });
 
     describe("media identity and removal", () => {
