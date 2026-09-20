@@ -1,6 +1,6 @@
 import * as http from "node:http";
 import { AddressInfo } from "node:net";
-import { createInternalApi, DiscordFacade, InternalApiDeps, RefreshedUrl } from "../internalApi";
+import { createInternalApi, DiscordFacade, InternalApiDeps, Poster, RefreshedUrl } from "../internalApi";
 import { mediaKey, QueryFn } from "../util/imageRemoval";
 
 export const KEY = "k".repeat(40);
@@ -8,6 +8,10 @@ export const GUILD = "100000000000000001";
 export const OTHER_GUILD = "100000000000000002";
 export const USER = "200000000000000001";
 export const OTHER_USER = "200000000000000002";
+// A member of GUILD who holds its adminRoleName.
+export const MOD_USER = "200000000000000003";
+// OWNER_USER_ID in the harness. Deliberately in no guild at all.
+export const OWNER = "200000000000000004";
 export const HOMIES_CHANNEL = "300000000000000001";
 
 export const GUILDS = {
@@ -23,7 +27,8 @@ export interface FakeRow {
     createdAt: string|null,
     source: string,
     channelId: string|null,
-    messageId: string|null
+    messageId: string|null,
+    originCheckedAt?: string|null
 }
 
 // Understands exactly the statements internalApi.ts issues and nothing else,
@@ -48,7 +53,7 @@ export class FakeDb {
     }
 
     private static project(row: FakeRow) {
-        return {id: row.id, url: row.url, createdAt: row.createdAt === null ? null : row.createdAt.replace(" ", "T") + "Z", source: row.source};
+        return {id: row.id, url: row.url, createdAt: row.createdAt === null ? null : row.createdAt.replace(" ", "T") + "Z", source: row.source, channelId: row.channelId, messageId: row.messageId, userId: row.userId};
     }
 
     query = async (sql: string, params: unknown[] = []): Promise<any> => {
@@ -66,7 +71,7 @@ export class FakeDb {
             const row = this.add(m[1], {url, guildId, userId, createdAt, source: "web"});
             return {affectedRows: 1, insertId: row.id};
         }
-        if((m = /^SELECT CAST\(id AS CHAR\) AS id, url, DATE_FORMAT\(createdAt, '%Y-%m-%dT%H:%i:%sZ'\) AS createdAt, source FROM (\w+) WHERE (.*)$/.exec(sql))) {
+        if((m = /^SELECT CAST\(id AS CHAR\) AS id, url, DATE_FORMAT\(createdAt, '%Y-%m-%dT%H:%i:%sZ'\) AS createdAt, source, channelId, messageId, userId FROM (\w+) WHERE (.*)$/.exec(sql))) {
             const rows = this.table(m[1]);
             const where = m[2];
             if(where === "id = CAST(? AS UNSIGNED)") {
@@ -74,14 +79,27 @@ export class FakeDb {
             }
             const order = " ORDER BY createdAt DESC, id DESC LIMIT ?";
             if(!where.endsWith(order)) throw new Error(`Unexpected SQL: ${sql}`);
-            const condition = where.slice(0, -order.length);
-            let matches = rows.filter(r => r.guildId === params[0] && r.userId === params[1]);
-            if(condition === "guildId = ? AND userId = ? AND (createdAt < ? OR (createdAt = ? AND id < CAST(? AS UNSIGNED)) OR createdAt IS NULL)") {
-                const [, , before, same, id] = params as string[];
+            let condition = where.slice(0, -order.length);
+            // The scope: one user's rows (the listing) or the whole guild (the pool).
+            let matches: FakeRow[];
+            let rest: unknown[];
+            if(condition.startsWith("guildId = ? AND userId = ?")) {
+                matches = rows.filter(r => r.guildId === params[0] && r.userId === params[1]);
+                condition = condition.slice("guildId = ? AND userId = ?".length);
+                rest = params.slice(2);
+            } else if(condition.startsWith("guildId = ?")) {
+                matches = rows.filter(r => r.guildId === params[0]);
+                condition = condition.slice("guildId = ?".length);
+                rest = params.slice(1);
+            } else {
+                throw new Error(`Unexpected SQL: ${sql}`);
+            }
+            if(condition === " AND (createdAt < ? OR (createdAt = ? AND id < CAST(? AS UNSIGNED)) OR createdAt IS NULL)") {
+                const [before, same, id] = rest as string[];
                 matches = matches.filter(r => r.createdAt === null || r.createdAt < before || (r.createdAt === same && r.id < BigInt(id)));
-            } else if(condition === "guildId = ? AND userId = ? AND createdAt IS NULL AND id < CAST(? AS UNSIGNED)") {
-                matches = matches.filter(r => r.createdAt === null && r.id < BigInt(params[2] as string));
-            } else if(condition !== "guildId = ? AND userId = ?") {
+            } else if(condition === " AND createdAt IS NULL AND id < CAST(? AS UNSIGNED)") {
+                matches = matches.filter(r => r.createdAt === null && r.id < BigInt(rest[0] as string));
+            } else if(condition !== "") {
                 throw new Error(`Unexpected SQL: ${sql}`);
             }
             matches.sort(compareNewestFirst);
@@ -90,18 +108,24 @@ export class FakeDb {
         if((m = /^SELECT COUNT\(\*\) AS total FROM (\w+) WHERE guildId = \? AND userId = \?$/.exec(sql))) {
             return [{total: BigInt(this.table(m[1]).filter(r => r.guildId === params[0] && r.userId === params[1]).length)}];
         }
+        if((m = /^SELECT COUNT\(\*\) AS total FROM (\w+) WHERE guildId = \?$/.exec(sql))) {
+            return [{total: BigInt(this.table(m[1]).filter(r => r.guildId === params[0]).length)}];
+        }
         if((m = /^SELECT COUNT\(\*\) AS total FROM (\w+) WHERE guildId = \? AND messageId = \?$/.exec(sql))) {
             return [{total: BigInt(this.table(m[1]).filter(r => r.guildId === params[0] && r.messageId === params[1]).length)}];
         }
-        if((m = /^SELECT channelId, messageId FROM (\w+) WHERE id = CAST\(\? AS UNSIGNED\) AND guildId = \? AND userId = \?$/.exec(sql))) {
-            return this.table(m[1]).filter(r => r.id === BigInt(params[0] as string) && r.guildId === params[1] && r.userId === params[2]).map(r => ({channelId: r.channelId, messageId: r.messageId}));
+        if((m = /^SELECT userId, channelId, messageId FROM (\w+) WHERE id = CAST\(\? AS UNSIGNED\) AND guildId = \?$/.exec(sql))) {
+            return this.table(m[1]).filter(r => r.id === BigInt(params[0] as string) && r.guildId === params[1]).map(r => ({userId: r.userId, channelId: r.channelId, messageId: r.messageId}));
         }
-        // removeRows for a removal the user asked for, as the API's DELETE route
-        // calls it: a plain delete. Anything touching the archive is "Unexpected SQL".
-        if((m = /^DELETE t FROM (\w+) t WHERE t\.id = CAST\(\? AS UNSIGNED\) AND t\.guildId = \? AND t\.userId = \?$/.exec(sql))) {
+        // removeRows for a removal a person asked for, as the API's DELETE route
+        // calls it: a plain delete, scoped to the guild, and to the asker too unless
+        // the asker is a moderator or the owner. Anything touching the archive is
+        // "Unexpected SQL".
+        if((m = /^DELETE t FROM (\w+) t WHERE t\.id = CAST\(\? AS UNSIGNED\) AND t\.guildId = \?( AND t\.userId = \?)?$/.exec(sql))) {
             const [id, guildId, userId] = params as string[];
+            if(params.length !== (m[2] ? 3 : 2)) throw new Error(`Wrong parameter count for: ${sql}`);
             const rows = this.table(m[1]);
-            const kept = rows.filter(r => !(r.id === BigInt(id) && r.guildId === guildId && r.userId === userId));
+            const kept = rows.filter(r => !(r.id === BigInt(id) && r.guildId === guildId && (!m![2] || r.userId === userId)));
             this.tables[m[1]] = kept;
             return {affectedRows: rows.length - kept.length, insertId: 0n};
         }
@@ -137,7 +161,17 @@ export function compareNewestFirst(a: {createdAt: string|null, id: bigint}, b: {
 
 export class FakeDiscord implements DiscordFacade {
     ready = true;
-    members = new Set<string>([`${GUILD}:${USER}`, `${OTHER_GUILD}:${USER}`, `${GUILD}:${OTHER_USER}`]);
+    members = new Set<string>([`${GUILD}:${USER}`, `${OTHER_GUILD}:${USER}`, `${GUILD}:${OTHER_USER}`, `${GUILD}:${MOD_USER}`]);
+    // Role names per member; a member without an entry holds no roles.
+    roles = new Map<string, string[]>([[`${GUILD}:${MOD_USER}`, ["@everyone", "Mods"]], [`${GUILD}:${USER}`, ["@everyone", "Regulars"]]]);
+    // What Discord knows about people, per guild and then globally. A user in
+    // neither is unknown to Discord (null).
+    guildProfiles = new Map<string, Poster>();
+    globalProfiles = new Map<string, Poster>();
+    posterLookups: {guildId: string, userIds: string[]}[] = [];
+    failPosters = false;
+    // Users the facade leaves out of its answer, as when a bound was hit.
+    unanswered = new Set<string>();
     knownGuilds: Record<string, {name: string, iconUrl: string|null}> = {
         [GUILD]: {name: "TNCord", iconUrl: "https://cdn.discordapp.com/icons/100000000000000001/abc.webp?size=128"},
         [OTHER_GUILD]: {name: "Clantus", iconUrl: null}
@@ -151,9 +185,20 @@ export class FakeDiscord implements DiscordFacade {
     refreshedExpiry = 0;
 
     isReady() { return this.ready; }
-    async isMember(guildId: string, userId: string) {
+    async memberRoles(guildId: string, userId: string) {
         this.memberLookups.push(`${guildId}:${userId}`);
-        return this.members.has(`${guildId}:${userId}`);
+        if(!this.knownGuilds[guildId] || !this.members.has(`${guildId}:${userId}`)) return null;
+        return this.roles.get(`${guildId}:${userId}`) || ["@everyone"];
+    }
+    async resolvePosters(guildId: string, userIds: string[]) {
+        this.posterLookups.push({guildId, userIds: [...userIds]});
+        if(this.failPosters) throw new Error("gateway timeout");
+        const result = new Map<string, Poster|null>();
+        for(const userId of userIds) {
+            if(this.unanswered.has(userId)) continue;
+            result.set(userId, this.guildProfiles.get(`${guildId}:${userId}`) ?? this.globalProfiles.get(userId) ?? null);
+        }
+        return result;
     }
     async getGuildInfo(guildId: string) { return this.knownGuilds[guildId] || null; }
     async refreshUrls(urls: string[]): Promise<RefreshedUrl[]> {
@@ -206,7 +251,7 @@ export async function createHarness(overrides: Partial<InternalApiDeps> = {}): P
     db.clock = () => clock.now;
     discord.refreshedExpiry = Math.floor(clock.now / 1000) + 24 * 3600;
     const server = createInternalApi({
-        config: {key: KEY, guilds: GUILDS},
+        config: {key: KEY, guilds: GUILDS, ownerUserId: OWNER},
         query: db.query,
         transaction: db.transaction,
         discord,

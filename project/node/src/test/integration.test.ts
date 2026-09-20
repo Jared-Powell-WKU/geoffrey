@@ -8,7 +8,8 @@ import { createInternalApi } from "../internalApi";
 import { mediaKey, QueryFn, removalSql, removeImageByUrl, removeImagesForMessages, removeRows, TransactionFn } from "../util/imageRemoval";
 import { createDbAccess } from "../util/dbAccess";
 import { insertAttachmentsSql } from "../util/submissionSql";
-import { FakeDiscord, GUILDS, GUILD, KEY, listen, makeRequester, MEDIA_KEY_CASES, OTHER_USER, OWN_KEY_CASES, USER } from "./helpers";
+import { backfillOrigins } from "../maintenance/backfillOrigins";
+import { FakeDiscord, GUILDS, GUILD, KEY, listen, makeRequester, MEDIA_KEY_CASES, MOD_USER, OTHER_USER, OWN_KEY_CASES, OWNER, USER } from "./helpers";
 
 const {TEST_DB_PORT, TEST_DB_HOST, TEST_DB_USER, TEST_DB_PASSWORD, TEST_DB_NAME} = process.env;
 
@@ -43,7 +44,7 @@ describe("internal API against MariaDB", {skip: TEST_DB_PORT ? false : "TEST_DB_
         await query(`INSERT INTO homies (url, guildId, userId, createdAt) VALUES ${"(?,?,?,?),".repeat(60).slice(0, -1)}`, values);
         await query("INSERT INTO homies (url, guildId, userId) VALUES (?,?,NULL)", ["https://example.com/integration/orphan.png", GUILD]);
 
-        server = createInternalApi({config: {key: KEY, guilds: GUILDS}, query, transaction, discord, log: {info: () => {}, warn: () => {}, error: console.error}});
+        server = createInternalApi({config: {key: KEY, guilds: GUILDS, ownerUserId: OWNER}, query, transaction, discord, log: {info: () => {}, warn: () => {}, error: console.error}});
         request = makeRequester(await listen(server));
     });
 
@@ -77,6 +78,31 @@ describe("internal API against MariaDB", {skip: TEST_DB_PORT ? false : "TEST_DB_
         assert.deepEqual([...new Set(discord.refreshCalls.flat())].sort(), seen.filter(i => i.url.includes("discordapp")).map(i => i.url).sort());
     });
 
+    test("the pool pages through every row of the guild in the same order, and names no user id", async () => {
+        const expected: any[] = await query("SELECT CAST(id AS CHAR) AS id, userId FROM homies WHERE guildId = ? ORDER BY createdAt IS NULL, createdAt DESC, id DESC", [GUILD]);
+        assert.equal(expected.length, 63);
+        discord.guildProfiles.set(`${GUILD}:${USER}`, {name: "Me", avatarUrl: null});
+        for(const [viewer, moderator] of [[OTHER_USER, false], [MOD_USER, true], [OWNER, true]] as [string, boolean][]) {
+            const seen: any[] = [];
+            let cursor: string|null = null;
+            do {
+                const res: any = await request("GET", `/v1/guilds/${GUILD}/pool?userId=${viewer}&category=homies&limit=10` + (cursor ? `&cursor=${cursor}` : ""));
+                assert.equal(res.status, 200);
+                assert.equal(res.body.total, 63);
+                assert.ok(!JSON.stringify(res.body).includes(USER) && !JSON.stringify(res.body).includes(OTHER_USER));
+                seen.push(...res.body.items);
+                cursor = res.body.nextCursor;
+            } while(cursor);
+            assert.deepEqual(seen.map(i => i.id), expected.map(r => r.id));
+            assert.deepEqual(seen.map(i => i.mine), expected.map(r => r.userId === viewer));
+            assert.deepEqual(seen.map(i => i.canDelete), expected.map(r => moderator || r.userId === viewer));
+            assert.deepEqual(seen.map(i => i.poster.name), expected.map(r => r.userId === USER ? "Me" : null));
+            // The two rows posted in Discord know their message; nothing else does.
+            assert.deepEqual(seen.filter(i => i.messageUrl !== null).map(i => i.messageUrl), new Array(2).fill(`https://discord.com/channels/${GUILD}/300000000000000001/400000000000000001`));
+        }
+        assert.equal((await request("GET", `/v1/guilds/${GUILD}/pool?userId=200000000000000009&category=homies`)).body.error.code, "NOT_A_MEMBER");
+    });
+
     test("add stores a web row with a UTC timestamp, and a duplicate is 409", async () => {
         const url = "https://example.com/integration/" + "w".repeat(1024 - "https://example.com/integration/".length);
         const before = Date.now();
@@ -100,13 +126,27 @@ describe("internal API against MariaDB", {skip: TEST_DB_PORT ? false : "TEST_DB_
         assert.deepEqual(first.body.items.map((i: any) => i.id).sort(), [res.body.item.id, upper.body.item.id].sort());
     });
 
-    test("delete is scoped to the owner, and the reaction goes with the message's last row", async () => {
-        const theirs: any[] = await query("SELECT CAST(id AS CHAR) AS id FROM homies WHERE guildId = ? AND userId = ? LIMIT 1", [GUILD, OTHER_USER]);
+    test("delete is for the poster, a moderator or the owner, and the reaction goes with the message's last row", async () => {
+        const theirs: any[] = await query("SELECT CAST(id AS CHAR) AS id FROM homies WHERE guildId = ? AND userId = ? ORDER BY id LIMIT 3", [GUILD, OTHER_USER]);
         const orphan: any[] = await query("SELECT CAST(id AS CHAR) AS id FROM homies WHERE guildId = ? AND userId IS NULL LIMIT 1", [GUILD]);
         for(const id of [theirs[0].id, orphan[0].id]) {
-            assert.equal((await request("DELETE", `/v1/guilds/${GUILD}/submissions/homies/${id}?userId=${USER}`)).status, 404);
+            const res = await request("DELETE", `/v1/guilds/${GUILD}/submissions/homies/${id}?userId=${USER}`);
+            assert.equal(res.status, 403);
+            assert.equal(res.body.error.code, "FORBIDDEN");
             assert.equal((await query("SELECT COUNT(*) AS n FROM homies WHERE id = ?", [id]))[0].n, 1n);
         }
+        // A moderator, the owner and the poster each remove one of OTHER_USER's rows; nothing else goes.
+        const before = (await query("SELECT COUNT(*) AS n FROM homies", []))[0].n;
+        for(const [index, asker] of [MOD_USER, OWNER, OTHER_USER].entries()) {
+            assert.deepEqual(await request("DELETE", `/v1/guilds/${GUILD}/submissions/homies/${theirs[index].id}?userId=${asker}`), {status: 200, body: {deleted: true}}, asker);
+            assert.equal((await request("DELETE", `/v1/guilds/${GUILD}/submissions/homies/${theirs[index].id}?userId=${asker}`)).status, 404);
+        }
+        assert.equal((await query("SELECT COUNT(*) AS n FROM homies", []))[0].n, before - 3n);
+        assert.equal((await query("SELECT COUNT(*) AS n FROM homies WHERE id IN (?,?,?)", theirs.map(r => r.id)))[0].n, 0n);
+        // The same id in another guild is out of a moderator's and the owner's reach.
+        const foreign = await query("INSERT INTO homies (url, guildId, userId) VALUES (?,?,?)", ["https://example.com/integration/foreign.png", "100000000000000555", USER]);
+        for(const asker of [MOD_USER, OWNER]) assert.equal((await request("DELETE", `/v1/guilds/${GUILD}/submissions/homies/${foreign.insertId}?userId=${asker}`)).status, 404);
+        assert.equal((await query("DELETE FROM homies WHERE guildId = ?", ["100000000000000555"])).affectedRows, 1);
         const message: any[] = await query("SELECT CAST(id AS CHAR) AS id FROM homies WHERE guildId = ? AND messageId = ? ORDER BY id", [GUILD, "400000000000000001"]);
         assert.equal(message.length, 2);
         assert.equal((await request("DELETE", `/v1/guilds/${GUILD}/submissions/pets/${message[0].id}?userId=${USER}`)).status, 404);
@@ -132,6 +172,62 @@ describe("internal API against MariaDB", {skip: TEST_DB_PORT ? false : "TEST_DB_
         // The pets table is a separate collection.
         assert.equal((await request("POST", `/v1/guilds/${GUILDS.clantus.guildId}/submissions`, {body: {userId: USER, category: "pets", url: base}})).status, 201);
         await query("DELETE FROM pets WHERE guildId = ?", [GUILDS.clantus.guildId]);
+    });
+
+    test("the origin backfill writes only its three columns, against the real schema", async () => {
+        const BG = "100000000000000888";
+        const channel = "300000000000000088";
+        const goneChannel = "300000000000000089";
+        const cdnOf = (channelId: string, n: number) => `https://cdn.discordapp.com/attachments/${channelId}/${1500000000000000000n + BigInt(n)}/old_${n}.png`;
+        for(const table of ["homies", "pets"]) await query(`DELETE FROM ${table} WHERE guildId = ?`, [BG]);
+        // Rows as they were before channelId and messageId existed, in both tables, plus a web row and a row that knows its message.
+        for(let n = 0; n < 6; n++) await query(`INSERT INTO ${n % 2 ? "pets" : "homies"} (url, guildId, userId, createdAt) VALUES (?,?,?,?)`, [cdnOf(channel, n), BG, USER, "2023-01-01 00:00:00"]);
+        for(let n = 0; n < 4; n++) await query("INSERT INTO homies (url, guildId, userId) VALUES (?,?,?)", [cdnOf(goneChannel, n), BG, USER]);
+        await query("INSERT INTO homies (url, guildId, userId, createdAt, source) VALUES (?,?,?,UTC_TIMESTAMP(),'web')", ["https://example.com/integration/backfill-web.png", BG, USER]);
+        await query("INSERT INTO pets (url, guildId, userId, channelId, messageId) VALUES (?,?,?,?,?)", [cdnOf(channel, 50), BG, USER, channel, "400000000000000050"]);
+        const snapshot = async () => (await query("SELECT 'homies' AS t, CAST(id AS CHAR) AS id, url, guildId, userId, DATE_FORMAT(createdAt, '%Y-%m-%d %H:%i:%s') AS createdAt, source, mediaKey FROM homies WHERE guildId = ? UNION ALL SELECT 'pets', CAST(id AS CHAR), url, guildId, userId, DATE_FORMAT(createdAt, '%Y-%m-%d %H:%i:%s'), source, mediaKey FROM pets WHERE guildId = ? ORDER BY 1, 2", [BG, BG]) as any[]).map(r => ({...r}));
+        const before = await snapshot();
+        assert.equal(before.length, 12);
+        const totals = async () => `${(await query("SELECT COUNT(*) AS n FROM homies", []))[0].n}/${(await query("SELECT COUNT(*) AS n FROM pets", []))[0].n}/${(await query("SELECT COUNT(*) AS n FROM submissions_archive", []))[0].n}`;
+        const totalsBefore = await totals();
+
+        // Messages 0 to 3 still exist (message 1 carries attachments 1 and 2); 4 and 5 were deleted.
+        const messages = [0, 1, 3].map(n => ({id: String(1500000000000000000n + BigInt(n) + 500n), attachments: (n === 1 ? [1, 2] : [n]).map(a => ({id: String(1500000000000000000n + BigInt(a))}))}));
+        const fetched: string[] = [];
+        const summary = await backfillOrigins({
+            query,
+            fetchAround: async (channelId) => {
+                fetched.push(channelId);
+                if(channelId === channel) return messages;
+                throw Object.assign(new Error("Unknown Channel"), {code: 10003, status: 404});
+            },
+            sleep: async () => {}
+        }, {maxLookups: 10_000, scanLimit: 100_000, intervalMs: 0});
+        assert.equal(summary.stopped, null);
+
+        const state: any[] = await query("SELECT url, channelId, messageId, originCheckedAt IS NOT NULL AS checked, TIMESTAMPDIFF(SECOND, originCheckedAt, UTC_TIMESTAMP()) AS age FROM homies WHERE guildId = ? UNION ALL SELECT url, channelId, messageId, originCheckedAt IS NOT NULL, TIMESTAMPDIFF(SECOND, originCheckedAt, UTC_TIMESTAMP()) FROM pets WHERE guildId = ?", [BG, BG]);
+        const of = (url: string) => { const row = state.find(r => r.url === url); return [row.channelId, row.messageId, Number(row.checked)]; };
+        assert.deepEqual(of(cdnOf(channel, 0)), [channel, messages[0].id, 1]);
+        assert.deepEqual(of(cdnOf(channel, 1)), [channel, messages[1].id, 1]);
+        assert.deepEqual(of(cdnOf(channel, 2)), [channel, messages[1].id, 1]);
+        assert.deepEqual(of(cdnOf(channel, 3)), [channel, messages[2].id, 1]);
+        assert.deepEqual(of(cdnOf(channel, 4)), [null, null, 1]);
+        assert.deepEqual(of(cdnOf(channel, 5)), [null, null, 1]);
+        for(let n = 0; n < 4; n++) assert.deepEqual(of(cdnOf(goneChannel, n)), [null, null, 1]);
+        assert.deepEqual(of("https://example.com/integration/backfill-web.png"), [null, null, 1]);
+        // The row that knew its message was not searched or stamped.
+        assert.deepEqual(of(cdnOf(channel, 50)), [channel, "400000000000000050", 0]);
+        // The stamp is UTC, like createdAt.
+        for(const row of state.filter(r => Number(r.checked))) assert.ok(Number(row.age) >= 0 && Number(row.age) < 120, `age ${row.age}`);
+        // One request settled the first four rows, two more found the deleted messages missing, one closed the other channel.
+        assert.deepEqual([fetched.filter(c => c === channel).length, fetched.filter(c => c === goneChannel).length], [3, 1]);
+        // No row appeared or disappeared anywhere, and no other column changed.
+        assert.deepEqual(await snapshot(), before);
+        assert.equal(await totals(), totalsBefore);
+        // Searched once: a second run has nothing to do.
+        const again = await backfillOrigins({query, fetchAround: async () => { throw new Error("nothing should be pending"); }, sleep: async () => {}}, {maxLookups: 10, scanLimit: 100_000, intervalMs: 0});
+        assert.deepEqual([again.pending, again.lookups, again.stopped], [0, 0, null]);
+        for(const table of ["homies", "pets"]) await query(`DELETE FROM ${table} WHERE guildId = ?`, [BG]);
     });
 
     describe("media identity and removal", () => {

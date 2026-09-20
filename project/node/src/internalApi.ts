@@ -18,10 +18,28 @@ export const MAX_BODY_BYTES = 8 * 1024;
 export const MAX_LIMIT = 48;
 export const MAX_URL_LENGTH = 1024;
 export const REFRESH_BATCH_SIZE = 50;
-const MEMBERSHIP_TTL_MS = 60_000;
+const ACCESS_TTL_MS = 60_000;
+const POSTER_TTL_MS = 10 * 60_000;
 const REFRESH_MARGIN_MS = 5 * 60_000;
-// The droplet has 1 GB of RAM, so both caches are bounded.
+// The droplet has 1 GB of RAM in total, so every cache is bounded.
+// Access and poster entries are a few dozen bytes each.
 const MAX_CACHE_ENTRIES = 5000;
+// Refreshed display URLs. One guild's pool is about 6,400 rows, and browsing it
+// must not evict what the previous pages just paid a Discord call for, so the
+// bound has to hold every stored row with room to grow: 20,000 is about three
+// times today's database. An entry is two URL strings (the longest stored one
+// is 389 characters, a refreshed one about 250) plus the Map slot, well under
+// 1 KB, so a full cache is 10 to 20 MB. Entries are replaced in place when
+// their signature expires (about a day), so it only fills as far as there are
+// distinct stored URLs.
+export const MAX_REFRESH_CACHE_ENTRIES = 20_000;
+// Request Guild Members takes at most 100 user ids.
+const MEMBER_CHUNK_SIZE = 100;
+const MEMBER_CHUNK_TIMEOUT_MS = 5_000;
+// People who left the guild cost one REST call each; the rest of a page waits
+// for the next request instead of queueing behind Discord's rate limit.
+export const MAX_USER_FETCHES = 10;
+const AVATAR_SIZE = 64;
 const CDN_HOSTS = ["cdn.discordapp.com", "media.discordapp.net"];
 const DISCORD_ID = /^[0-9]{5,25}$/;
 const ROW_ID = /^[0-9]{1,20}$/;
@@ -29,6 +47,7 @@ const CURSOR_DATE = /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$/;
 const ER_DUP_ENTRY = 1062;
 // Unknown Member, Unknown User.
 const NOT_A_MEMBER_CODES = [10007, 10013];
+const UNKNOWN_USER = 10013;
 const CAMERA = "📸";
 
 export type { QueryFn, TransactionFn };
@@ -38,9 +57,21 @@ export interface RefreshedUrl {
     refreshed: string
 }
 
+export interface Poster {
+    name: string|null,
+    avatarUrl: string|null
+}
+
 export interface DiscordFacade {
     isReady(): boolean;
-    isMember(guildId: string, userId: string): Promise<boolean>;
+    // The names of the roles the user holds in that guild, asked of Discord
+    // afresh. Null when the user is not a member or the bot is not in the guild.
+    memberRoles(guildId: string, userId: string): Promise<string[]|null>;
+    // How that guild shows these users. A user missing from the result was not
+    // looked up (a bound was hit, or Discord did not answer) and may be asked
+    // about again; null means Discord does not know the account.
+    resolvePosters(guildId: string, userIds: string[]): Promise<Map<string, Poster|null>>;
+    // Null when the bot is not in that guild.
     getGuildInfo(guildId: string): Promise<{name: string, iconUrl: string|null}|null>;
     refreshUrls(urls: string[]): Promise<RefreshedUrl[]>;
     postNotice(channelId: string, content: string): Promise<void>;
@@ -52,7 +83,9 @@ type Logger = Pick<Console, "info"|"warn"|"error">;
 export interface InternalApiDeps {
     config: {
         key: string,
-        guilds: GuildDictionary
+        guilds: GuildDictionary,
+        // OWNER_USER_ID. Null, absent or not a Discord id: nobody is the owner.
+        ownerUserId?: string|null
     };
     query: QueryFn;
     transaction: TransactionFn;
@@ -67,7 +100,33 @@ interface Submission {
     url: string,
     displayUrl: string,
     createdAt: string|null,
-    source: "discord"|"web"
+    source: "discord"|"web",
+    messageUrl: string|null
+}
+
+interface PoolItem extends Submission {
+    poster: Poster,
+    mine: boolean,
+    canDelete: boolean
+}
+
+interface Access {
+    member: boolean,
+    moderator: boolean
+}
+
+// Null for an unset value. An invalid one is reported as such so the caller can warn.
+export function parseOwnerUserId(raw: string|undefined): {ownerUserId: string|null, invalid: boolean} {
+    const value = (raw || "").trim();
+    if(!value) return {ownerUserId: null, invalid: false};
+    return DISCORD_ID.test(value) ? {ownerUserId: value, invalid: false} : {ownerUserId: null, invalid: true};
+}
+
+export function messageUrlOf(guildId: string, channelId: unknown, messageId: unknown): string|null {
+    if(typeof channelId !== "string" || typeof messageId !== "string") return null;
+    // The site renders this as a link, so only real snowflakes make one.
+    if(!DISCORD_ID.test(channelId) || !DISCORD_ID.test(messageId)) return null;
+    return `https://discord.com/channels/${guildId}/${channelId}/${messageId}`;
 }
 
 class ApiError extends Error {
@@ -141,10 +200,10 @@ export function decodeCursor(cursor: string): {createdAt: string|null, id: strin
 }
 
 // Map iteration order is insertion order, so the first key is the oldest.
-function setBounded<V>(cache: Map<string, V>, key: string, value: V) {
+function setBounded<V>(cache: Map<string, V>, key: string, value: V, maxEntries: number = MAX_CACHE_ENTRIES) {
     cache.delete(key);
     cache.set(key, value);
-    while(cache.size > MAX_CACHE_ENTRIES) {
+    while(cache.size > maxEntries) {
         const oldest = cache.keys().next().value;
         if(oldest === undefined) break;
         cache.delete(oldest);
@@ -160,7 +219,10 @@ export function createInternalApi(deps: InternalApiDeps): http.Server {
     }
     const sha256 = (value: string) => createHash("sha256").update(value, "utf8").digest();
     const keyDigest = sha256(config.key);
-    const membershipCache = new Map<string, {member: boolean, expiresAt: number}>();
+    // Anything that is not a Discord id can never equal a validated userId.
+    const ownerUserId = typeof config.ownerUserId === "string" && DISCORD_ID.test(config.ownerUserId) ? config.ownerUserId : null;
+    const accessCache = new Map<string, {access: Access, expiresAt: number}>();
+    const posterCache = new Map<string, {poster: Poster, expiresAt: number}>();
     const refreshCache = new Map<string, {displayUrl: string, expiresAt: number}>();
 
     function isAuthorized(header: string|undefined): boolean {
@@ -201,19 +263,58 @@ export function createInternalApi(deps: InternalApiDeps): http.Server {
         return value;
     }
 
-    async function isMember(guildId: string, userId: string): Promise<boolean> {
-        const cacheKey = `${guildId}:${userId}`;
-        const cached = membershipCache.get(cacheKey);
-        if(cached && cached.expiresAt > now()) return cached.member;
-        const member = await discord.isMember(guildId, userId);
-        setBounded(membershipCache, cacheKey, {member, expiresAt: now() + MEMBERSHIP_TTL_MS});
-        return member;
+    // Membership and moderator status come from the same answer and are cached
+    // together. A moderator holds the role named adminRoleName, the rule
+    // checkForImageDeletion in events.ts applies to reactions.
+    async function getAccess(guild: SupportedGuild, userId: string): Promise<Access> {
+        if(ownerUserId !== null && userId === ownerUserId) {
+            // The owner need not be in the guild, but the bot must be.
+            const present = await discord.getGuildInfo(guild.guildId) !== null;
+            return {member: present, moderator: present};
+        }
+        const cacheKey = `${guild.guildId}:${userId}`;
+        const cached = accessCache.get(cacheKey);
+        if(cached && cached.expiresAt > now()) return cached.access;
+        const roles = await discord.memberRoles(guild.guildId, userId);
+        const adminRole = typeof guild.adminRoleName === "string" ? guild.adminRoleName : "";
+        const access: Access = {member: roles !== null, moderator: roles !== null && adminRole.length > 0 && roles.includes(adminRole)};
+        setBounded(accessCache, cacheKey, {access, expiresAt: now() + ACCESS_TTL_MS});
+        return access;
     }
 
-    async function requireMember(guildId: string, userId: string) {
-        if(!await isMember(guildId, userId)) {
-            throw new ApiError(403, "NOT_A_MEMBER", "The user is not a member of that guild.");
+    async function requireMember(guild: SupportedGuild, userId: string): Promise<Access> {
+        const access = await getAccess(guild, userId);
+        if(!access.member) throw new ApiError(403, "NOT_A_MEMBER", "The user is not a member of that guild.");
+        return access;
+    }
+
+    // Never rejects. A poster missing from the result could not be resolved this time.
+    async function resolvePosters(guildId: string, userIds: string[]): Promise<Map<string, Poster>> {
+        const result = new Map<string, Poster>();
+        const unknown: string[] = [];
+        for(const userId of new Set(userIds)) {
+            const cached = posterCache.get(`${guildId}:${userId}`);
+            if(cached && cached.expiresAt > now()) result.set(userId, cached.poster);
+            else unknown.push(userId);
         }
+        if(!unknown.length) return result;
+        try {
+            const resolved = await discord.resolvePosters(guildId, unknown);
+            for(const userId of unknown) {
+                // Not looked up this time: not cached, so the next request asks again.
+                if(!resolved.has(userId)) continue;
+                const found = resolved.get(userId);
+                const poster: Poster = {
+                    name: typeof found?.name === "string" && found.name.length ? found.name : null,
+                    avatarUrl: typeof found?.avatarUrl === "string" && found.avatarUrl.startsWith("https://") ? found.avatarUrl : null
+                };
+                result.set(userId, poster);
+                setBounded(posterCache, `${guildId}:${userId}`, {poster, expiresAt: now() + POSTER_TTL_MS});
+            }
+        } catch(e) {
+            log.error(`Internal API: unable to resolve poster names in guild ${guildId}.`, e);
+        }
+        return result;
     }
 
     async function resolveDisplayUrls(urls: string[]): Promise<Map<string, string>> {
@@ -241,7 +342,7 @@ export function createInternalApi(deps: InternalApiDeps): http.Server {
                     result.set(entry.original, entry.refreshed);
                     const expiry = parseCdnExpiry(entry.refreshed);
                     if(expiry !== null && expiry - REFRESH_MARGIN_MS > now()) {
-                        setBounded(refreshCache, entry.original, {displayUrl: entry.refreshed, expiresAt: expiry - REFRESH_MARGIN_MS});
+                        setBounded(refreshCache, entry.original, {displayUrl: entry.refreshed, expiresAt: expiry - REFRESH_MARGIN_MS}, MAX_REFRESH_CACHE_ENTRIES);
                     }
                 }
             } catch(e) {
@@ -251,9 +352,12 @@ export function createInternalApi(deps: InternalApiDeps): http.Server {
         return result;
     }
 
-    const SUBMISSION_COLUMNS = "CAST(id AS CHAR) AS id, url, DATE_FORMAT(createdAt, '%Y-%m-%dT%H:%i:%sZ') AS createdAt, source";
+    // userId is read for the pool's mine and canDelete. toSubmissions builds each
+    // item field by field, so it cannot reach a response.
+    const SUBMISSION_COLUMNS = "CAST(id AS CHAR) AS id, url, DATE_FORMAT(createdAt, '%Y-%m-%dT%H:%i:%sZ') AS createdAt, source, channelId, messageId, userId";
 
-    async function toSubmissions(rows: any[], category: Category): Promise<Submission[]> {
+    // One item per row, in the order of rows.
+    async function toSubmissions(rows: any[], category: Category, guildId: string): Promise<Submission[]> {
         const displayUrls = await resolveDisplayUrls(rows.map(row => String(row.url)));
         return rows.map(row => {
             const url = String(row.url);
@@ -263,14 +367,17 @@ export function createInternalApi(deps: InternalApiDeps): http.Server {
                 url,
                 displayUrl: displayUrls.get(url) || url,
                 createdAt: row.createdAt === null || row.createdAt === undefined ? null : String(row.createdAt),
-                source: row.source === "web" ? "web" : "discord"
+                source: row.source === "web" ? "web" : "discord",
+                messageUrl: messageUrlOf(guildId, row.channelId, row.messageId)
             };
         });
     }
 
     async function listGuilds(userId: string) {
         const entries = await Promise.all(Object.entries(config.guilds).map(async ([key, guild]) => {
-            if(!guild?.guildId || !await isMember(guild.guildId, userId)) return null;
+            if(!guild?.guildId) return null;
+            const access = await getAccess(guild, userId);
+            if(!access.member) return null;
             const info = await discord.getGuildInfo(guild.guildId);
             // A configured guild the bot is not in (or cannot see yet) is omitted.
             if(!info) return null;
@@ -279,13 +386,16 @@ export function createInternalApi(deps: InternalApiDeps): http.Server {
                 key,
                 name: info.name,
                 iconUrl: info.iconUrl,
-                categories: CATEGORIES.filter(category => channelsFor(guild, category).length > 0)
+                categories: CATEGORIES.filter(category => channelsFor(guild, category).length > 0),
+                canModerate: access.moderator
             };
         }));
         return {guilds: entries.filter(entry => entry !== null)};
     }
 
-    async function listSubmissions(guildId: string, params: URLSearchParams) {
+    // The listing and the pool are one query; only the scope differs: the
+    // asker's own rows, or every row of the guild. Both check membership first.
+    async function listPage(guildId: string, params: URLSearchParams, scope: "own"|"pool") {
         const userId = parseDiscordId(params.get("userId"), "userId");
         const category = parseCategory(params.get("category"));
         let limit = MAX_LIMIT;
@@ -301,12 +411,14 @@ export function createInternalApi(deps: InternalApiDeps): http.Server {
             cursor = decodeCursor(rawCursor);
             if(!cursor) throw invalid("cursor is not valid.");
         }
-        getGuild(guildId);
-        await requireMember(guildId, userId);
+        const {guild} = getGuild(guildId);
+        const access = await requireMember(guild, userId);
 
         const table = tableFor(category);
-        let where = "guildId = ? AND userId = ?";
-        const values: unknown[] = [guildId, userId];
+        const scopeWhere = scope === "own" ? "guildId = ? AND userId = ?" : "guildId = ?";
+        const scopeValues: unknown[] = scope === "own" ? [guildId, userId] : [guildId];
+        let where = scopeWhere;
+        const values: unknown[] = [...scopeValues];
         if(cursor && cursor.createdAt !== null) {
             const createdAt = cursor.createdAt.replace("T", " ").replace("Z", "");
             where += " AND (createdAt < ? OR (createdAt = ? AND id < CAST(? AS UNSIGNED)) OR createdAt IS NULL)";
@@ -317,15 +429,38 @@ export function createInternalApi(deps: InternalApiDeps): http.Server {
         }
         // MariaDB sorts NULL lowest, so DESC already puts unknown dates last.
         const rows: any[] = await query(`SELECT ${SUBMISSION_COLUMNS} FROM ${table} WHERE ${where} ORDER BY createdAt DESC, id DESC LIMIT ?`, [...values, limit + 1]);
-        const counted = await query(`SELECT COUNT(*) AS total FROM ${table} WHERE guildId = ? AND userId = ?`, [guildId, userId]);
+        const counted = await query(`SELECT COUNT(*) AS total FROM ${table} WHERE ${scopeWhere}`, scopeValues);
         const page = rows.slice(0, limit);
-        const items = await toSubmissions(page, category);
+        const items = await toSubmissions(page, category, guildId);
         const last = items[items.length - 1];
         return {
-            items,
+            userId, access, page, items,
             nextCursor: rows.length > limit && last ? encodeCursor(last.createdAt, last.id) : null,
             total: Number(counted?.[0]?.total ?? 0)
         };
+    }
+
+    async function listSubmissions(guildId: string, params: URLSearchParams) {
+        const {items, nextCursor, total} = await listPage(guildId, params, "own");
+        return {items, nextCursor, total};
+    }
+
+    async function listPool(guildId: string, params: URLSearchParams) {
+        const {userId, access, page, items, nextCursor, total} = await listPage(guildId, params, "pool");
+        const posterOf = (row: any): string|null => typeof row.userId === "string" && DISCORD_ID.test(row.userId) ? row.userId : null;
+        const posters = await resolvePosters(guildId, page.map(posterOf).filter((id): id is string => id !== null));
+        const poolItems: PoolItem[] = items.map((item, index) => {
+            const posterId = posterOf(page[index]);
+            const mine = posterId !== null && posterId === userId;
+            // The poster's id decides these three fields and goes no further.
+            return {
+                ...item,
+                poster: (posterId !== null && posters.get(posterId)) || {name: null, avatarUrl: null},
+                mine,
+                canDelete: mine || access.moderator
+            };
+        });
+        return {items: poolItems, nextCursor, total};
     }
 
     async function addSubmission(guildId: string, body: unknown) {
@@ -337,7 +472,7 @@ export function createInternalApi(deps: InternalApiDeps): http.Server {
         if(urlProblem) throw invalid(urlProblem);
         const url = fields.url as string;
         const {guild} = getGuild(guildId);
-        await requireMember(guildId, userId);
+        await requireMember(guild, userId);
         // The notice keeps mods informed, so a category without a configured channel
         // cannot take web submissions: 404, the same as an unsupported guild.
         const noticeChannel = channelsFor(guild, category)[0];
@@ -360,7 +495,7 @@ export function createInternalApi(deps: InternalApiDeps): http.Server {
         }
         const rows: any[] = await query(`SELECT ${SUBMISSION_COLUMNS} FROM ${table} WHERE id = CAST(? AS UNSIGNED)`, [String(inserted.insertId)]);
         if(!rows?.length) throw new Error("The inserted row could not be read back.");
-        const [item] = await toSubmissions(rows, category);
+        const [item] = await toSubmissions(rows, category, guildId);
         try {
             await discord.postNotice(noticeChannel, formatWebAddNotice(userId, url));
         } catch(e) {
@@ -373,14 +508,25 @@ export function createInternalApi(deps: InternalApiDeps): http.Server {
         const category = parseCategory(rawCategory);
         if(!ROW_ID.test(rawId)) throw invalid("id is not a valid row id.");
         const userId = parseDiscordId(params.get("userId"), "userId");
-        getGuild(guildId);
-        await requireMember(guildId, userId);
+        const {guild} = getGuild(guildId);
+        const access = await requireMember(guild, userId);
 
         const table = tableFor(category);
-        const owned = [rawId, guildId, userId];
-        const existing: any[] = await query(`SELECT channelId, messageId FROM ${table} WHERE id = CAST(? AS UNSIGNED) AND guildId = ? AND userId = ?`, owned);
-        // DELETE erases the row: a removal the user asked for keeps no copy anywhere.
-        const removed = await transaction((inTransaction) => removeRows(inTransaction, table, "removed_on_site", "t.id = CAST(? AS UNSIGNED) AND t.guildId = ? AND t.userId = ?", owned));
+        const existing: any[] = await query(`SELECT userId, channelId, messageId FROM ${table} WHERE id = CAST(? AS UNSIGNED) AND guildId = ?`, [rawId, guildId]);
+        if(!existing?.length) throw notFound("No such submission.");
+        const mine = typeof existing[0].userId === "string" && existing[0].userId === userId;
+        if(!mine && !access.moderator) {
+            throw new ApiError(403, "FORBIDDEN", "Only the poster, a moderator of the guild or the owner can remove this submission.");
+        }
+        // Always scoped to the id and the guild, and to the asker as well when
+        // being the poster is the asker's only claim to the row.
+        const where = "t.id = CAST(? AS UNSIGNED) AND t.guildId = ?" + (access.moderator ? "" : " AND t.userId = ?");
+        const values = access.moderator ? [rawId, guildId] : [rawId, guildId, userId];
+        // DELETE erases the row: a removal a person asked for keeps no copy
+        // anywhere, and a moderator or the owner is a person like any other
+        // (the policy is in util/imageRemoval.ts).
+        const removed = await transaction((inTransaction) => removeRows(inTransaction, table, "removed_on_site", where, values));
+        // Someone else removed it between the two statements.
         if(!removed) throw notFound("No such submission.");
 
         const channelId = existing?.[0]?.channelId;
@@ -463,6 +609,11 @@ export function createInternalApi(deps: InternalApiDeps): http.Server {
             if(!discord.isReady()) throw notReady();
             return {status: 200, body: await listGuilds(userId)};
         }
+        if(segments.length === 4 && segments[1] === "guilds" && segments[3] === "pool" && method === "GET") {
+            const guildId = parseDiscordId(segments[2], "guildId");
+            if(!discord.isReady()) throw notReady();
+            return {status: 200, body: await listPool(guildId, url.searchParams)};
+        }
         if(segments[1] === "guilds" && segments[3] === "submissions") {
             if(segments.length === 4 && method === "GET") {
                 const guildId = parseDiscordId(segments[2], "guildId");
@@ -501,18 +652,64 @@ export function createInternalApi(deps: InternalApiDeps): http.Server {
 export function createDiscordFacade(client: Client): DiscordFacade {
     return {
         isReady: () => client.isReady(),
-        async isMember(guildId, userId) {
+        async memberRoles(guildId, userId) {
             const guild = client.guilds.cache.get(guildId);
-            if(!guild) return false;
+            if(!guild) return null;
             try {
-                // force: without the GuildMembers intent the member cache never
-                // learns that someone left, so a cached member proves nothing.
-                await guild.members.fetch({user: userId, force: true, cache: false});
-                return true;
+                // force: without the GuildMembers intent the member cache never learns
+                // that someone left or lost a role, so a cached member proves nothing.
+                const member = await guild.members.fetch({user: userId, force: true, cache: false});
+                // Names come from the guild's role cache, which the Guilds intent keeps current.
+                return member.roles.cache.map(role => role.name);
             } catch(e: any) {
-                if(NOT_A_MEMBER_CODES.includes(e?.code)) return false;
+                if(NOT_A_MEMBER_CODES.includes(e?.code)) return null;
                 throw e;
             }
+        },
+        async resolvePosters(guildId, userIds) {
+            const result = new Map<string, Poster|null>();
+            const guild = client.guilds.cache.get(guildId);
+            if(!guild || !userIds.length) return result;
+            const absent: string[] = [];
+            for(let i = 0; i < userIds.length; i += MEMBER_CHUNK_SIZE) {
+                const chunk = userIds.slice(i, i + MEMBER_CHUNK_SIZE);
+                const cachedBefore = new Set(chunk.filter(id => guild.members.cache.has(id)));
+                let members;
+                try {
+                    // One gateway request (Request Guild Members by user id) for the whole
+                    // chunk. Explicit ids need no privileged intent; only listing a guild does.
+                    members = await guild.members.fetch({user: chunk, time: MEMBER_CHUNK_TIMEOUT_MS});
+                } catch(e) {
+                    // Who is still in the guild is unknown, so nobody of this chunk is
+                    // answered (or cached) and the next request asks again.
+                    console.error(`Internal API: the member request for ${chunk.length} posters in guild ${guildId} failed.`, e);
+                    continue;
+                }
+                for(const id of chunk) {
+                    const member = members.get(id);
+                    if(!member) {
+                        absent.push(id);
+                        continue;
+                    }
+                    result.set(id, {name: member.displayName, avatarUrl: member.avatarURL({size: AVATAR_SIZE}) ?? member.user.avatarURL({size: AVATAR_SIZE})});
+                    // A chunk lands in the member cache, where nothing would ever update
+                    // it without the GuildMembers intent, and the reaction handlers read
+                    // roles from that cache. Leave it the way it was.
+                    if(!cachedBefore.has(id)) guild.members.cache.delete(id);
+                }
+            }
+            // People who left the guild: their global name. Bounded, because each is
+            // a REST call; the rest stay unanswered until a later request.
+            for(const id of absent.slice(0, MAX_USER_FETCHES)) {
+                try {
+                    const user = await client.users.fetch(id, {cache: false});
+                    result.set(id, {name: user.displayName, avatarUrl: user.avatarURL({size: AVATAR_SIZE})});
+                } catch(e: any) {
+                    if(e?.code === UNKNOWN_USER) result.set(id, null);
+                    else console.error(`Internal API: unable to fetch user ${id}.`, e);
+                }
+            }
+            return result;
         },
         async getGuildInfo(guildId) {
             const guild = client.guilds.cache.get(guildId);
@@ -565,8 +762,10 @@ export function startInternalApi(options: StartInternalApiOptions): http.Server|
         if(parsed >= 1 && parsed <= 65535) port = parsed;
         else log.warn(`INTERNAL_API_PORT is not a valid port; using ${DEFAULT_PORT}.`);
     }
+    const owner = parseOwnerUserId(env.OWNER_USER_ID);
+    if(owner.invalid) log.warn("OWNER_USER_ID is not a valid Discord id; nobody is the owner.");
     const server = createInternalApi({
-        config: {key, guilds},
+        config: {key, guilds, ownerUserId: owner.ownerUserId},
         query: options.query,
         transaction: options.transaction,
         discord: createDiscordFacade(options.client),

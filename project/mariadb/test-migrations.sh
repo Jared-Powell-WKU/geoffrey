@@ -3,10 +3,10 @@
 # tables (not defaults/, which already has the final shape) and checks that no
 # data is lost and the deployed bot's SQL keeps working: first 001 and 002 on
 # the original shape, then 003 on that result with duplicates of every kind
-# seen in production, then 004 on an archive that holds rows of every reason.
-# Then runs the internal
-# API's integration test against the same database when it has been compiled
-# (cd project/node && npm test).
+# seen in production, then 004 on an archive that holds rows of every reason,
+# then 005 on that, checking that the image deployed before it still works.
+# Then runs the internal API's integration test against the same database when
+# it has been compiled (cd project/node && npm test).
 #
 #   ./test-migrations.sh
 #   MARIADB_IMAGE=mariadb:11.8 ./test-migrations.sh    pin the image
@@ -222,10 +222,7 @@ q "SELECT $ARCHIVECOLS FROM submissions_archive WHERE reason IN ('duplicate', 'g
 allrows > "$WORK/live-before004"
 
 echo "Applying 004"
-for f in "$HERE"/migrations/00[4-9]_*.sql "$HERE"/migrations/0[1-9][0-9]_*.sql; do
-    [ -f "$f" ] || continue
-    apply "$f" && pass "applied $(basename "$f")" || fail "applying $(basename "$f")"
-done
+apply "$HERE/migrations/004_erase_person_removals.sql" && pass "applied 004_erase_person_removals.sql" || fail "applying 004_erase_person_removals.sql"
 q "SELECT $ARCHIVECOLS FROM submissions_archive ORDER BY archiveId" > "$WORK/after004"
 if diff -q "$WORK/kept004" "$WORK/after004" >/dev/null; then pass "the person-initiated rows are gone; the 12 duplicate and 2 gone_from_discord rows are byte-identical"; else fail "004 changed the wrong rows"; diff "$WORK/kept004" "$WORK/after004" | head -10; fi
 check "14 archive rows remain" "$(wc -l < "$WORK/after004" | tr -d ' ')" "14"
@@ -233,6 +230,47 @@ check "the reason ENUM is narrowed" "$(q "SELECT CONCAT(COLUMN_TYPE, ' ', IS_NUL
 allrows > "$WORK/live-after004"
 if diff -q "$WORK/live-before004" "$WORK/live-after004" >/dev/null; then pass "004 does not touch homies or pets"; else fail "004 changed live rows"; fi
 if q "INSERT INTO submissions_archive (category, id, url, guildId, reason) VALUES ('homies', 900009, 'https://example.com/x.png', '$G3', 'removed_on_site')" 2>/dev/null; then fail "a person-initiated reason can still be archived"; else pass "a person-initiated reason can no longer be archived"; fi
+
+echo "Before 005"
+POOL_QUERY="SELECT id FROM homies WHERE guildId = '500000000000000001' ORDER BY createdAt DESC, id DESC LIMIT 49"
+POOL_PAGE_QUERY="SELECT id FROM homies WHERE guildId = '500000000000000001' AND (createdAt < '2023-04-24 10:08:00' OR (createdAt = '2023-04-24 10:08:00' AND id < 100) OR createdAt IS NULL) ORDER BY createdAt DESC, id DESC LIMIT 49"
+# Why 005 adds an index: without it the pool query sorts every row of the guild for each page.
+echo "  info  pool query plan without the pool index: $(q "EXPLAIN $POOL_QUERY" | awk -F'\t' '{print "key=" $6 ", rows=" $9 ", " $10}')"
+FULLCOLS="$ROWCOLS, mediaKey"
+fullrows() { q "SELECT 'homies', $FULLCOLS FROM homies UNION ALL SELECT 'pets', $FULLCOLS FROM pets ORDER BY 1, 2"; }
+fullrows > "$WORK/before005"
+q "SELECT $ARCHIVECOLS FROM submissions_archive ORDER BY archiveId" > "$WORK/archive-before005"
+
+echo "Applying 005 and anything later"
+for f in "$HERE"/migrations/00[5-9]_*.sql "$HERE"/migrations/0[1-9][0-9]_*.sql; do
+    [ -f "$f" ] || continue
+    apply "$f" && pass "applied $(basename "$f")" || fail "applying $(basename "$f")"
+done
+fullrows > "$WORK/after005"
+if diff -q "$WORK/before005" "$WORK/after005" >/dev/null; then pass "every homies and pets row is byte-for-byte unchanged by 005 ($(wc -l < "$WORK/after005" | tr -d ' ') rows)"; else fail "005 changed or lost rows"; diff "$WORK/before005" "$WORK/after005" | head -10; fi
+q "SELECT $ARCHIVECOLS FROM submissions_archive ORDER BY archiveId" > "$WORK/archive-after005"
+if diff -q "$WORK/archive-before005" "$WORK/archive-after005" >/dev/null; then pass "005 does not touch the archive"; else fail "005 changed the archive"; fi
+for t in homies pets; do
+    check "$t.originCheckedAt is a nullable DATETIME, the last column, NULL everywhere" "$(q "SELECT CONCAT(COLUMN_TYPE, ' ', IS_NULLABLE, ' ', ORDINAL_POSITION = (SELECT MAX(ORDINAL_POSITION) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = 'tncord' AND TABLE_NAME = '$t'), ' ', (SELECT COUNT(*) FROM $t WHERE originCheckedAt IS NOT NULL)) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = 'tncord' AND TABLE_NAME = '$t' AND COLUMN_NAME = 'originCheckedAt'")" "datetime YES 1 0"
+    check "$t has the pool index" "$(q "SELECT GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = 'tncord' AND TABLE_NAME = '$t' AND INDEX_NAME = '${t}_pool_IDX'")" "guildId,createdAt,id"
+    check "$t primary key is still (url, guildId)" "$(q "SELECT GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = 'tncord' AND TABLE_NAME = '$t' AND INDEX_NAME = 'PRIMARY'")" "url,guildId"
+done
+q "ANALYZE TABLE homies, pets" >/dev/null
+check "the pool query reads the pool index in order, without sorting" "$(q "EXPLAIN $POOL_QUERY" | awk -F'\t' '{print $6, ($10 ~ /filesort/ ? "filesort" : "no-filesort")}')" "homies_pool_IDX no-filesort"
+check "a later pool page does too" "$(q "EXPLAIN $POOL_PAGE_QUERY" | awk -F'\t' '{print $6, ($10 ~ /filesort/ ? "filesort" : "no-filesort")}')" "homies_pool_IDX no-filesort"
+check "the listing query still uses the listing index" "$(q "EXPLAIN SELECT id FROM homies WHERE guildId = '500000000000000001' AND userId = '600000000000000001' ORDER BY createdAt DESC, id DESC LIMIT 49" | awk -F'\t' '{print $6}')" "homies_listing_IDX"
+
+echo "The image deployed before 005, against the new shape"
+# Migrations run before the containers are replaced, and a failed deploy rolls
+# the image back but not the schema, so these must keep working.
+PREV_URL="$A/1400000000000000777/previous_image.png$NEW"
+q "INSERT INTO homies (url, guildId, userId, channelId, messageId, createdAt) VALUES ('$PREV_URL', '$G3', 'u9', '700000000000000009', '1400000000000000778', '2025-01-01 00:00:00') ON DUPLICATE KEY UPDATE userId = userId" && pass "its saveAttachments insert works" || fail "previous image's insert"
+q "INSERT INTO pets (url, guildId, userId, createdAt, source) VALUES ('https://example.com/previous-web.png', '$G3', 'u9', UTC_TIMESTAMP(), 'web')" && pass "its web-add insert works" || fail "previous image's web insert"
+check "its listing select works" "$(q "SELECT COUNT(*) FROM (SELECT CAST(id AS CHAR) AS id, url, DATE_FORMAT(createdAt, '%Y-%m-%dT%H:%i:%sZ') AS createdAt, source FROM homies WHERE guildId = '$G3' AND userId = 'u9' ORDER BY createdAt DESC, id DESC LIMIT 49) l")" "1"
+check "new rows start unsearched" "$(q "SELECT COUNT(*) FROM homies WHERE url = '$PREV_URL' AND originCheckedAt IS NULL")" "1"
+check "its sweep can still archive a row" "$(q "START TRANSACTION; INSERT INTO submissions_archive (category, id, url, guildId, userId, createdAt, source, channelId, messageId, reason) SELECT 'homies', t.id, t.url, t.guildId, t.userId, t.createdAt, t.source, t.channelId, t.messageId, 'gone_from_discord' FROM homies t WHERE t.url = '$PREV_URL'; SELECT ROW_COUNT(); ROLLBACK")" "1"
+check "its delete works" "$(q "DELETE t FROM homies t WHERE t.guildId = '$G3' AND t.messageId IN ('1400000000000000778'); SELECT ROW_COUNT()")" "1"
+q "DELETE FROM pets WHERE url = 'https://example.com/previous-web.png'"
 
 echo "Re-running every migration"
 everything > "$WORK/first"
@@ -265,7 +303,7 @@ else
     if (cd "$HERE/../node" && TEST_DB_HOST=127.0.0.1 TEST_DB_PORT="$PORT" TEST_DB_USER=root TEST_DB_PASSWORD="$PW" TEST_DB_NAME=tncord timeout 120 node --test dist/test/integration.test.js) > "$WORK/api" 2>&1; then
         # A skipped suite also exits 0, so insist that tests really ran.
         RAN="$(grep -Eo 'pass [0-9]+' "$WORK/api" | tr -dc '0-9')"; SKIPPED="$(grep -Eo 'skipped [0-9]+' "$WORK/api" | tr -dc '0-9')"
-        if [ "${RAN:-0}" -ge 11 ] && [ "${SKIPPED:-1}" = 0 ]; then pass "API integration test ($RAN passed, $SKIPPED skipped)"; else fail "API integration test did not run"; cat "$WORK/api"; fi
+        if [ "${RAN:-0}" -ge 13 ] && [ "${SKIPPED:-1}" = 0 ]; then pass "API integration test ($RAN passed, $SKIPPED skipped)"; else fail "API integration test did not run"; cat "$WORK/api"; fi
     else
         fail "API integration test"; cat "$WORK/api"
     fi
