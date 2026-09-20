@@ -27,7 +27,7 @@ services:
       - geoffrey
 
   geoffrey:
-    image: ${GEOFFREY_IMAGE:-ghcr.io/jared-powell-wku/discord-bot}:${IMAGE_TAG:?IMAGE_TAG is not set. Use /opt/stacks/bin/deploy rather than docker compose directly}
+    image: ${GEOFFREY_IMAGE:-ghcr.io/jared-powell-wku/geoffrey}:${IMAGE_TAG:?IMAGE_TAG is not set. Use /opt/stacks/bin/deploy rather than docker compose directly}
     restart: unless-stopped
     init: true
     env_file: geoffrey.env

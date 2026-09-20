@@ -24,7 +24,10 @@ export const MAX_LOOKUPS_PER_RUN = 12;
 // Pending rows read per table and run. They are the rows one request can settle.
 export const SCAN_LIMIT = 500;
 export const FIRST_RUN_DELAY_MS = 60_000;
-export const BUSY_DELAY_MS = 5 * 60_000;
+// Two minutes between runs of twelve lookups is about 240 channel requests an
+// hour, far below what Discord allows, and clears the first backlog of about
+// 6,400 rows in a day at the very worst instead of two.
+export const BUSY_DELAY_MS = 2 * 60_000;
 export const IDLE_DELAY_MS = 60 * 60_000;
 export const ERROR_DELAY_MS = 15 * 60_000;
 // Unknown Channel, Missing Access: asking again row by row would change nothing.

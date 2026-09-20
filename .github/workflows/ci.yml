@@ -20,7 +20,10 @@ permissions:
   contents: read
 
 env:
-  IMAGE: ghcr.io/jared-powell-wku/discord-bot
+  # Named after this repository, which therefore owns the package. The older
+  # discord-bot package belongs to the archived Discord-Bot repository, and a
+  # workflow token from here is refused by it.
+  IMAGE: ghcr.io/jared-powell-wku/geoffrey
 
 jobs:
   verify:
