@@ -483,6 +483,9 @@ describe("pool", () => {
         assert.equal(h.db.tables.homies.filter(r => r.guildId === GUILD).length, 0);
     });
 
+    // The avatar URLs here are made up. A real one from Discord holds the
+    // account's id, because that is how Discord addresses an avatar; see
+    // "Poster names" in the contract. Every other field is checked below.
     test("no user id appears anywhere in a pool response", async () => {
         seed();
         for(const userId of [USER, MOD_USER, OWNER]) {
