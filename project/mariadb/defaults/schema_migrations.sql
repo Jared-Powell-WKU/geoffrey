@@ -13,4 +13,5 @@ INSERT INTO tncord.schema_migrations (`name`) VALUES
 	('001_submission_columns.sql'),
 	('002_backfill_created_at.sql'),
 	('003_dedupe_media.sql'),
-	('004_erase_person_removals.sql');
+	('004_erase_person_removals.sql'),
+	('005_origin_checked_at.sql');

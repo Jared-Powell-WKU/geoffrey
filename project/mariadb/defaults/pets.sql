@@ -12,11 +12,13 @@ CREATE TABLE tncord.pets (
 		     THEN CONCAT('discord:', SUBSTRING_INDEX(SUBSTRING_INDEX(`url`, '/', 6), '/', -2))
 		     ELSE `url` END
 	) PERSISTENT,
+	`originCheckedAt` datetime DEFAULT NULL,
 	CONSTRAINT pets_PK PRIMARY KEY (`url`,`guildId`),
 	UNIQUE KEY pets_id_UK (`id`),
 	UNIQUE KEY pets_media_UK (`guildId`,`mediaKey`),
 	KEY pets_listing_IDX (`guildId`,`userId`,`createdAt`,`id`),
-	KEY pets_message_IDX (`messageId`)
+	KEY pets_message_IDX (`messageId`),
+	KEY pets_pool_IDX (`guildId`,`createdAt`,`id`)
 )
 ENGINE=InnoDB
 DEFAULT CHARSET=utf8mb4

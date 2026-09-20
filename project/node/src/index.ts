@@ -8,6 +8,7 @@ import { checkEvPortStatus } from './util/checkEvPortStatus';
 import { GuildDictionary, query, transaction } from './util/util';
 import { startHealthHeartbeat } from './util/health';
 import { startInternalApi } from './internalApi';
+import { startOriginBackfill } from './maintenance/backfillOrigins';
 
 const client = new Client({
     intents:[GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.GuildMessageReactions],
@@ -40,6 +41,8 @@ for (const dir of commandDirs) {
 client.once(Events.ClientReady, (c: Client)=> {
     console.info(`Ready! Logging in as ${c.user?.tag}`)
     startHealthHeartbeat(c);
+    // Looks up the original message of old submissions, a few requests at a time.
+    startOriginBackfill({client: c, query});
 })
 client.login(process.env.CLIENT_TOKEN);
 startInternalApi({client, query, transaction});

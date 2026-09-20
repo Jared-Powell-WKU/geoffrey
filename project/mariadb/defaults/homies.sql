@@ -12,11 +12,13 @@ CREATE TABLE tncord.homies (
 		     THEN CONCAT('discord:', SUBSTRING_INDEX(SUBSTRING_INDEX(`url`, '/', 6), '/', -2))
 		     ELSE `url` END
 	) PERSISTENT,
+	`originCheckedAt` datetime DEFAULT NULL,
 	CONSTRAINT homies_PK PRIMARY KEY (`url`,`guildId`),
 	UNIQUE KEY homies_id_UK (`id`),
 	UNIQUE KEY homies_media_UK (`guildId`,`mediaKey`),
 	KEY homies_listing_IDX (`guildId`,`userId`,`createdAt`,`id`),
-	KEY homies_message_IDX (`messageId`)
+	KEY homies_message_IDX (`messageId`),
+	KEY homies_pool_IDX (`guildId`,`createdAt`,`id`)
 )
 ENGINE=InnoDB
 DEFAULT CHARSET=utf8mb4
