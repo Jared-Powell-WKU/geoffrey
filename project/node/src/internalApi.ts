@@ -1,7 +1,7 @@
 // Private HTTP API consumed by cantus.dev. The contract lives in the cantus.dev
 // repo at docs/geoffrey-internal-api.md; change it there first.
 import * as http from "node:http";
-import { createHash, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { Client, Routes } from "discord.js";
 import { getTableByCommandName } from "./util/tables";
 import { formatWebAddNotice } from "./util/storedUrl";
@@ -48,6 +48,9 @@ const AVATAR_SIZE = 64;
 const CDN_HOSTS = ["cdn.discordapp.com", "media.discordapp.net"];
 const DISCORD_ID = /^[0-9]{5,25}$/;
 const ROW_ID = /^[0-9]{1,20}$/;
+// A poster key: the first 16 bytes of an HMAC in base64url, see posterKeyOf.
+const POSTER_KEY_BYTES = 16;
+const POSTER_KEY = /^[A-Za-z0-9_-]{22}$/;
 const CURSOR_DATE = /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$/;
 const ER_DUP_ENTRY = 1062;
 // Unknown Member, Unknown User.
@@ -62,9 +65,16 @@ export interface RefreshedUrl {
     refreshed: string
 }
 
+// What Discord says about an account, as the facade resolves it.
 export interface Poster {
     name: string|null,
     avatarUrl: string|null
+}
+
+// A poster as a response carries them: the Discord profile plus the key that
+// stands in for the user id (see posterKeyOf). Null when the row has no poster.
+export interface PublicPoster extends Poster {
+    key: string|null
 }
 
 export interface DiscordFacade {
@@ -110,7 +120,7 @@ interface Submission {
 }
 
 interface PoolItem extends Submission {
-    poster: Poster,
+    poster: PublicPoster,
     mine: boolean,
     canDelete: boolean
 }
@@ -122,7 +132,7 @@ interface Access {
 
 interface LeaderboardUserEntry {
     rank: number,
-    poster: Poster,
+    poster: PublicPoster,
     mine: boolean,
     score: number
 }
@@ -171,6 +181,16 @@ export function parseOwnerUserId(raw: string|undefined): {ownerUserId: string|nu
     const value = (raw || "").trim();
     if(!value) return {ownerUserId: null, invalid: false};
     return DISCORD_ID.test(value) ? {ownerUserId: value, invalid: false} : {ownerUserId: null, invalid: true};
+}
+
+// The key that stands for a poster in a response and in the pool's `poster`
+// filter: 22 characters of base64url from an HMAC of the guild and the user id,
+// keyed with the API key. It is stable, so the site can put it in an address,
+// and it is the same person's key on every request; it is different in every
+// guild, and it cannot be turned back into the user id or checked against a
+// guessed one without the API key. A new API key gives everyone new keys.
+export function posterKeyOf(secret: string, guildId: string, userId: string): string {
+    return createHmac("sha256", secret).update(`poster:${guildId}:${userId}`, "utf8").digest().subarray(0, POSTER_KEY_BYTES).toString("base64url");
 }
 
 export function messageUrlOf(guildId: string, channelId: unknown, messageId: unknown): string|null {
@@ -275,6 +295,9 @@ export function createInternalApi(deps: InternalApiDeps): http.Server {
     const accessCache = new Map<string, {access: Access, expiresAt: number}>();
     const posterCache = new Map<string, {poster: Poster, expiresAt: number}>();
     const refreshCache = new Map<string, {displayUrl: string, expiresAt: number}>();
+    // "<guildId>:<posterKey>" to the user id it was made from. A key never
+    // changes meaning, so there is no expiry, only the bound.
+    const posterKeyCache = new Map<string, string>();
 
     function isAuthorized(header: string|undefined): boolean {
         const match = /^Bearer (.+)$/i.exec(header || "");
@@ -326,6 +349,41 @@ export function createInternalApi(deps: InternalApiDeps): http.Server {
         if(value === null || value === "all") return {category: "all", categories: [...CATEGORIES]};
         const category = parseCategory(value);
         return {category, categories: [category]};
+    }
+
+    // Null when absent. The shape only; whether it names anyone is found later.
+    function parsePosterKey(value: string|null): string|null {
+        if(value === null) return null;
+        if(!POSTER_KEY.test(value)) throw invalid("poster is not a valid poster key.");
+        return value;
+    }
+
+    const keyOf = (guildId: string, userId: string) => posterKeyOf(config.key, guildId, userId);
+
+    // The user id a poster key stands for, or null when nobody in the guild's
+    // tables has that key. An HMAC cannot be reversed, so the guild's distinct
+    // posters (a few hundred) are keyed and compared; the answer is cached.
+    async function resolvePosterKey(guildId: string, posterKey: string): Promise<string|null> {
+        const cacheKey = `${guildId}:${posterKey}`;
+        const cached = posterKeyCache.get(cacheKey);
+        if(cached !== undefined) return cached;
+        for(const category of CATEGORIES) {
+            const rows: any[] = await query(`SELECT DISTINCT userId FROM ${tableFor(category)} WHERE guildId = ? AND userId IS NOT NULL`, [guildId]);
+            for(const row of rows) {
+                const userId = typeof row.userId === "string" && DISCORD_ID.test(row.userId) ? row.userId : null;
+                if(userId !== null && keyOf(guildId, userId) === posterKey) {
+                    setBounded(posterKeyCache, cacheKey, userId);
+                    return userId;
+                }
+            }
+        }
+        return null;
+    }
+
+    // The poster of a response: the Discord profile, if resolved, and the key.
+    function publicPoster(guildId: string, posterId: string|null, posters: Map<string, Poster>): PublicPoster {
+        const profile = (posterId !== null && posters.get(posterId)) || {name: null, avatarUrl: null};
+        return {name: profile.name, avatarUrl: profile.avatarUrl, key: posterId !== null ? keyOf(guildId, posterId) : null};
     }
 
     function parseLimit(value: string|null, fallback: number, max: number): number {
@@ -467,11 +525,13 @@ export function createInternalApi(deps: InternalApiDeps): http.Server {
     }
 
     // The listing and the pool are one query; only the scope differs: the
-    // asker's own rows, or every row of the guild. Both check membership first.
+    // asker's own rows, every row of the guild, or (the pool with a poster
+    // key) every row of one member. All check membership first.
     async function listPage(guildId: string, params: URLSearchParams, scope: "own"|"pool") {
         const userId = parseDiscordId(params.get("userId"), "userId");
         const category = parseCategory(params.get("category"));
         const limit = parseLimit(params.get("limit"), MAX_LIMIT, MAX_LIMIT);
+        const posterKey = scope === "pool" ? parsePosterKey(params.get("poster")) : null;
         let cursor: {createdAt: string|null, id: string}|null = null;
         const rawCursor = params.get("cursor");
         if(rawCursor !== null) {
@@ -481,9 +541,17 @@ export function createInternalApi(deps: InternalApiDeps): http.Server {
         const {guild} = getGuild(guildId);
         const access = await requireMember(guild, userId);
 
+        // The member the pool is narrowed to. A key that names nobody in this
+        // guild has nothing to list, and no statement is run for it.
+        const posterId = posterKey !== null ? await resolvePosterKey(guildId, posterKey) : null;
+        if(posterKey !== null && posterId === null) {
+            return {userId, access, page: [], items: [], nextCursor: null, total: 0, posterKey, posterId};
+        }
+
         const table = tableFor(category);
-        const scopeWhere = scope === "own" ? "guildId = ? AND userId = ?" : "guildId = ?";
-        const scopeValues: unknown[] = scope === "own" ? [guildId, userId] : [guildId];
+        const scopeUserId = scope === "own" ? userId : posterId;
+        const scopeWhere = scopeUserId !== null ? "guildId = ? AND userId = ?" : "guildId = ?";
+        const scopeValues: unknown[] = scopeUserId !== null ? [guildId, scopeUserId] : [guildId];
         let where = scopeWhere;
         const values: unknown[] = [...scopeValues];
         if(cursor && cursor.createdAt !== null) {
@@ -503,7 +571,8 @@ export function createInternalApi(deps: InternalApiDeps): http.Server {
         return {
             userId, access, page, items,
             nextCursor: rows.length > limit && last ? encodeCursor(last.createdAt, last.id) : null,
-            total: Number(counted?.[0]?.total ?? 0)
+            total: Number(counted?.[0]?.total ?? 0),
+            posterKey, posterId
         };
     }
 
@@ -513,21 +582,26 @@ export function createInternalApi(deps: InternalApiDeps): http.Server {
     }
 
     async function listPool(guildId: string, params: URLSearchParams) {
-        const {userId, access, page, items, nextCursor, total} = await listPage(guildId, params, "pool");
+        const {userId, access, page, items, nextCursor, total, posterKey, posterId: filteredId} = await listPage(guildId, params, "pool");
         const posterOf = (row: any): string|null => typeof row.userId === "string" && DISCORD_ID.test(row.userId) ? row.userId : null;
-        const posters = await resolvePosters(guildId, page.map(posterOf).filter((id): id is string => id !== null));
+        // The member the pool is narrowed to is named in the answer even when
+        // this category has nothing of theirs, so the page can say whose it is.
+        const wanted = page.map(posterOf).filter((id): id is string => id !== null);
+        if(filteredId !== null) wanted.push(filteredId);
+        const posters = await resolvePosters(guildId, wanted);
         const poolItems: PoolItem[] = items.map((item, index) => {
             const posterId = posterOf(page[index]);
             const mine = posterId !== null && posterId === userId;
             // The poster's id decides these three fields and goes no further.
             return {
                 ...item,
-                poster: (posterId !== null && posters.get(posterId)) || {name: null, avatarUrl: null},
+                poster: publicPoster(guildId, posterId, posters),
                 mine,
                 canDelete: mine || access.moderator
             };
         });
-        return {items: poolItems, nextCursor, total};
+        if(posterKey === null) return {items: poolItems, nextCursor, total};
+        return {items: poolItems, nextCursor, total, poster: filteredId !== null ? publicPoster(guildId, filteredId, posters) : null};
     }
 
     // A ranking of the guild's collection. Every board reads whole tables (a
@@ -567,7 +641,7 @@ export function createInternalApi(deps: InternalApiDeps): http.Server {
             const ranks = rankOf(top, ([, score]) => score);
             const entries: LeaderboardUserEntry[] = top.map(([posterId, score], index) => ({
                 rank: ranks[index],
-                poster: posters.get(posterId) || {name: null, avatarUrl: null},
+                poster: publicPoster(guildId, posterId, posters),
                 mine: posterId === userId,
                 score
             }));
@@ -601,7 +675,7 @@ export function createInternalApi(deps: InternalApiDeps): http.Server {
                 const mine = posterId !== null && posterId === userId;
                 entries[top.indexOf(entry)] = {
                     rank: ranks[top.indexOf(entry)],
-                    item: {...items[index], poster: (posterId !== null && posters.get(posterId)) || {name: null, avatarUrl: null}, mine, canDelete: mine || access.moderator},
+                    item: {...items[index], poster: publicPoster(guildId, posterId, posters), mine, canDelete: mine || access.moderator},
                     mediaCount: entry.mediaCount,
                     score: entry.score
                 };

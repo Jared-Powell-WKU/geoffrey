@@ -2,7 +2,7 @@ import { test, describe, beforeEach, afterEach } from "node:test";
 import * as assert from "node:assert/strict";
 import * as http from "node:http";
 import * as net from "node:net";
-import { createInternalApi, createDiscordFacade, decodeCursor, encodeCursor, MAX_USER_FETCHES, messageUrlOf, parseCdnExpiry, parseOwnerUserId, rankOf, startInternalApi, validateSubmissionUrl } from "../internalApi";
+import { createInternalApi, createDiscordFacade, decodeCursor, encodeCursor, MAX_USER_FETCHES, messageUrlOf, parseCdnExpiry, parseOwnerUserId, posterKeyOf, rankOf, startInternalApi, validateSubmissionUrl } from "../internalApi";
 import { formatWebAddNotice, getStoredUrlFromContent } from "../util/storedUrl";
 import { getTableByCommandName } from "../util/tables";
 import { compareNewestFirst, createHarness, FakeDb, FakeDiscord, GUILD, GUILDS, Harness, HOMIES_CHANNEL, KEY, MOD_USER, OTHER_GUILD, OTHER_USER, OWNER, USER } from "./helpers";
@@ -11,6 +11,9 @@ const STRANGER = "200000000000000009";
 const list = (query: string) => `/v1/guilds/${GUILD}/submissions?${query}`;
 const pool = (query: string, guildId: string = GUILD) => `/v1/guilds/${guildId}/pool?${query}`;
 const remove = (id: bigint|string, userId: string, category: string = "homies", guildId: string = GUILD) => `/v1/guilds/${guildId}/submissions/${category}/${id}?userId=${userId}`;
+// The poster key the harness's API key gives a user in a guild.
+const keyFor = (userId: string, guildId: string = GUILD) => posterKeyOf(KEY, guildId, userId);
+const nobody = {name: null, avatarUrl: null, key: null};
 
 let h: Harness;
 beforeEach(async () => { h = await createHarness(); });
@@ -440,18 +443,18 @@ describe("pool", () => {
         assert.deepEqual(res.body, {
             items: [
                 {id: String(rows.mine.id), category: "homies", url: rows.mine.url, displayUrl: rows.mine.url, createdAt: "2024-05-05T10:00:00Z", source: "discord", messageUrl: `https://discord.com/channels/${GUILD}/${HOMIES_CHANNEL}/400000000000000001`,
-                    poster: {name: "Nick in TNCord", avatarUrl: "https://cdn.discordapp.com/guilds/1/users/2/avatars/a.webp?size=64"}, mine: true, canDelete: true},
+                    poster: {name: "Nick in TNCord", avatarUrl: "https://cdn.discordapp.com/guilds/1/users/2/avatars/a.webp?size=64", key: keyFor(USER)}, mine: true, canDelete: true},
                 {id: String(rows.theirs.id), category: "homies", url: rows.theirs.url, displayUrl: rows.theirs.url, createdAt: "2024-05-04T10:00:00Z", source: "discord", messageUrl: null,
-                    poster: {name: "other", avatarUrl: null}, mine: false, canDelete: false},
+                    poster: {name: "other", avatarUrl: null, key: keyFor(OTHER_USER)}, mine: false, canDelete: false},
                 {id: String(rows.mods.id), category: "homies", url: rows.mods.url, displayUrl: rows.mods.url, createdAt: "2024-05-03T10:00:00Z", source: "web", messageUrl: null,
-                    poster: {name: "A Mod", avatarUrl: "https://cdn.discordapp.com/avatars/3/b.webp?size=64"}, mine: false, canDelete: false},
-                // Someone who left the guild keeps their global name; an account Discord cannot resolve has none.
+                    poster: {name: "A Mod", avatarUrl: "https://cdn.discordapp.com/avatars/3/b.webp?size=64", key: keyFor(MOD_USER)}, mine: false, canDelete: false},
+                // Someone who left the guild keeps their global name; an account Discord cannot resolve has none, but both keep their key.
                 {id: String(rows.left.id), category: "homies", url: rows.left.url, displayUrl: rows.left.url, createdAt: "2024-05-02T10:00:00Z", source: "discord", messageUrl: null,
-                    poster: {name: "Gone Global", avatarUrl: "https://cdn.discordapp.com/avatars/5/c.webp?size=64"}, mine: false, canDelete: false},
+                    poster: {name: "Gone Global", avatarUrl: "https://cdn.discordapp.com/avatars/5/c.webp?size=64", key: keyFor(LEFT)}, mine: false, canDelete: false},
                 {id: String(rows.ghost.id), category: "homies", url: rows.ghost.url, displayUrl: rows.ghost.url, createdAt: "2024-05-01T10:00:00Z", source: "discord", messageUrl: null,
-                    poster: {name: null, avatarUrl: null}, mine: false, canDelete: false},
+                    poster: {name: null, avatarUrl: null, key: keyFor(GHOST)}, mine: false, canDelete: false},
                 {id: String(rows.orphan.id), category: "homies", url: rows.orphan.url, displayUrl: rows.orphan.url, createdAt: null, source: "discord", messageUrl: null,
-                    poster: {name: null, avatarUrl: null}, mine: false, canDelete: false}
+                    poster: nobody, mine: false, canDelete: false}
             ],
             nextCursor: null,
             total: 6
@@ -488,12 +491,107 @@ describe("pool", () => {
             for(const id of [USER, OTHER_USER, MOD_USER, OWNER, LEFT, GHOST]) assert.ok(!text.includes(id), `${id} leaked to ${userId}`);
             for(const item of res.body.items) {
                 assert.deepEqual(Object.keys(item).sort(), ["canDelete", "category", "createdAt", "displayUrl", "id", "messageUrl", "mine", "poster", "source", "url"]);
-                assert.deepEqual(Object.keys(item.poster).sort(), ["avatarUrl", "name"]);
+                assert.deepEqual(Object.keys(item.poster).sort(), ["avatarUrl", "key", "name"]);
+                if(item.poster.key !== null) assert.match(item.poster.key, /^[A-Za-z0-9_-]{22}$/);
             }
         }
         // Nor in the own listing, which reads the same columns.
         const own = await h.request("GET", list(`userId=${USER}&category=homies`));
         assert.deepEqual(Object.keys(own.body.items[0]).sort(), ["category", "createdAt", "displayUrl", "id", "messageUrl", "source", "url"]);
+    });
+
+    test("a poster key is one person's in one guild: stable, keyed with the API key, and different elsewhere", () => {
+        assert.equal(keyFor(USER), keyFor(USER));
+        assert.notEqual(keyFor(USER), keyFor(OTHER_USER));
+        assert.notEqual(keyFor(USER), keyFor(USER, OTHER_GUILD));
+        assert.notEqual(keyFor(USER), posterKeyOf("j".repeat(40), GUILD, USER));
+        assert.match(keyFor(USER), /^[A-Za-z0-9_-]{22}$/);
+        assert.ok(!keyFor(USER).includes(USER.slice(0, 8)));
+    });
+
+    test("poster narrows the pool to one member's rows, names them, and counts only theirs", async () => {
+        const rows = seed();
+        h.db.add("homies", {url: "https://example.com/theirs-2.png", userId: OTHER_USER, createdAt: "2024-05-06 10:00:00"});
+        h.db.add("pets", {url: "https://example.com/their-pet.png", userId: OTHER_USER, createdAt: "2024-05-06 11:00:00"});
+        const res = await h.request("GET", pool(`userId=${USER}&category=homies&poster=${keyFor(OTHER_USER)}`));
+        assert.equal(res.status, 200);
+        assert.deepEqual(res.body.items.map((i: any) => [i.url, i.poster.key, i.mine, i.canDelete]), [
+            ["https://example.com/theirs-2.png", keyFor(OTHER_USER), false, false],
+            [rows.theirs.url, keyFor(OTHER_USER), false, false]
+        ]);
+        assert.equal(res.body.total, 2);
+        assert.equal(res.body.nextCursor, null);
+        assert.deepEqual(res.body.poster, {name: "other", avatarUrl: null, key: keyFor(OTHER_USER)});
+        // The statements are scoped to that member, and only the viewer's own rights are marked.
+        for(const {sql, params} of h.db.statements.filter(s => !s.sql.startsWith("SELECT DISTINCT"))) {
+            assert.match(sql, / FROM homies WHERE guildId = \? AND userId = \?/);
+            assert.equal(params[1], OTHER_USER);
+        }
+        assert.ok(!JSON.stringify(res.body).includes(OTHER_USER));
+        // The other collection, the member's own view, and a moderator's.
+        assert.deepEqual((await h.request("GET", pool(`userId=${USER}&category=pets&poster=${keyFor(OTHER_USER)}`))).body.items.map((i: any) => i.url), ["https://example.com/their-pet.png"]);
+        assert.deepEqual((await h.request("GET", pool(`userId=${OTHER_USER}&category=homies&poster=${keyFor(OTHER_USER)}`))).body.items.map((i: any) => [i.mine, i.canDelete]), [[true, true], [true, true]]);
+        assert.deepEqual((await h.request("GET", pool(`userId=${MOD_USER}&category=homies&poster=${keyFor(OTHER_USER)}`))).body.items.map((i: any) => [i.mine, i.canDelete]), [[false, true], [false, true]]);
+        // Without the filter the answer has no poster field at all.
+        assert.ok(!("poster" in (await h.request("GET", pool(`userId=${USER}&category=homies`))).body));
+    });
+
+    test("a member with nothing in this collection is still named; a key that names nobody lists nothing and runs no listing", async () => {
+        seed();
+        h.db.add("pets", {url: "https://example.com/only-a-pet.png", userId: "200000000000000007", createdAt: "2024-05-06 11:00:00"});
+        h.discord.guildProfiles.set(`${GUILD}:200000000000000007`, {name: "Pet Person", avatarUrl: null});
+        const empty = await h.request("GET", pool(`userId=${USER}&category=homies&poster=${keyFor("200000000000000007")}`));
+        assert.deepEqual(empty.body, {items: [], nextCursor: null, total: 0, poster: {name: "Pet Person", avatarUrl: null, key: keyFor("200000000000000007")}});
+
+        h.db.statements.length = 0;
+        const unknown = await h.request("GET", pool(`userId=${USER}&category=homies&poster=${keyFor(STRANGER)}`));
+        assert.equal(unknown.status, 200);
+        assert.deepEqual(unknown.body, {items: [], nextCursor: null, total: 0, poster: null});
+        assert.ok(h.db.statements.every(s => s.sql.startsWith("SELECT DISTINCT userId FROM ")));
+        assert.equal(h.discord.posterLookups.filter(l => l.userIds.includes(STRANGER)).length, 0);
+        // The same key in another guild is somebody else's, so it names nobody there either.
+        h.db.add("homies", {url: "https://example.com/elsewhere-theirs.png", guildId: OTHER_GUILD, userId: OTHER_USER});
+        assert.deepEqual((await h.request("GET", pool(`userId=${USER}&category=homies&poster=${keyFor(OTHER_USER)}`, OTHER_GUILD))).body, {items: [], nextCursor: null, total: 0, poster: null});
+        assert.equal((await h.request("GET", pool(`userId=${USER}&category=homies&poster=${keyFor(OTHER_USER, OTHER_GUILD)}`, OTHER_GUILD))).body.total, 1);
+    });
+
+    test("a malformed poster key is refused before any SQL or Discord call; the own listing ignores the parameter", async () => {
+        seed();
+        h.db.statements.length = 0;
+        for(const poster of ["", "abc", keyFor(USER).slice(0, 21), keyFor(USER) + "A", keyFor(USER).slice(0, 21) + "+", keyFor(USER).slice(0, 21) + "=", USER, encodeURIComponent("a b c d e f g h i j k l")]) {
+            const res = await h.request("GET", pool(`userId=${USER}&category=homies&poster=${poster}`));
+            assert.equal(res.status, 400, poster);
+            assert.equal(res.body.error.code, "INVALID_REQUEST");
+        }
+        assert.equal(h.db.statements.length, 0);
+        assert.equal(h.discord.memberLookups.length, 0);
+        // A stranger with a well-formed key is still a stranger.
+        assert.equal((await h.request("GET", pool(`userId=${STRANGER}&category=homies&poster=${keyFor(USER)}`))).status, 403);
+        assert.equal(h.db.statements.length, 0);
+        const own = await h.request("GET", list(`userId=${USER}&category=homies&poster=${keyFor(OTHER_USER)}`));
+        assert.equal(own.status, 200);
+        assert.equal(own.body.total, 1);
+        assert.ok(!("poster" in own.body));
+    });
+
+    test("the cursor walks one member's rows with the filter kept, and the key is looked up once", async () => {
+        for(let i = 0; i < 60; i++) {
+            h.db.add("homies", {url: `https://example.com/${i}.png`, createdAt: i % 4 === 0 ? null : `2024-02-${String(1 + i % 28).padStart(2, "0")} 00:00:00`, userId: [USER, OTHER_USER, null][i % 3]});
+        }
+        const expected = h.db.tables.homies.filter(r => r.guildId === GUILD && r.userId === OTHER_USER).sort(compareNewestFirst).map(r => String(r.id));
+        assert.equal(expected.length, 20);
+        const seen: string[] = [];
+        let cursor: string|null = null;
+        do {
+            const res: any = await h.request("GET", pool(`userId=${USER}&category=homies&limit=7&poster=${keyFor(OTHER_USER)}` + (cursor ? `&cursor=${cursor}` : "")));
+            assert.equal(res.status, 200);
+            assert.equal(res.body.total, 20);
+            assert.ok(res.body.items.every((i: any) => i.poster.key === keyFor(OTHER_USER)));
+            seen.push(...res.body.items.map((i: any) => i.id));
+            cursor = res.body.nextCursor;
+        } while(cursor);
+        assert.deepEqual(seen, expected);
+        assert.equal(h.db.statements.filter(s => s.sql.startsWith("SELECT DISTINCT")).length, 1);
     });
 
     test("the cursor walks the whole pool once, in the listing's order, and total counts the guild", async () => {
@@ -546,7 +644,7 @@ describe("pool", () => {
         seed();
         h.discord.unanswered.add(LEFT);
         const path = pool(`userId=${USER}&category=homies`);
-        assert.deepEqual((await h.request("GET", path)).body.items[3].poster, {name: null, avatarUrl: null});
+        assert.deepEqual((await h.request("GET", path)).body.items[3].poster, {name: null, avatarUrl: null, key: keyFor(LEFT)});
         h.discord.unanswered.clear();
         assert.deepEqual((await h.request("GET", path)).body.items[3].poster.name, "Gone Global");
         assert.deepEqual(h.discord.posterLookups[1], {guildId: GUILD, userIds: [LEFT]});
@@ -559,15 +657,15 @@ describe("pool", () => {
         const res = await h.request("GET", path);
         assert.equal(res.status, 200);
         assert.equal(res.body.total, 6);
-        for(const item of res.body.items) assert.deepEqual(item.poster, {name: null, avatarUrl: null});
+        for(const item of res.body.items) assert.deepEqual([item.poster.name, item.poster.avatarUrl], [null, null]);
         assert.equal(h.errors.length, 1);
 
         h.discord.failPosters = false;
         h.discord.guildProfiles.set(`${GUILD}:${USER}`, {name: "", avatarUrl: "http://insecure.example/a.png"});
         h.discord.guildProfiles.set(`${GUILD}:${OTHER_USER}`, {name: 5, avatarUrl: {}} as any);
         const odd = await h.request("GET", path);
-        assert.deepEqual(odd.body.items[0].poster, {name: null, avatarUrl: null});
-        assert.deepEqual(odd.body.items[1].poster, {name: null, avatarUrl: null});
+        assert.deepEqual(odd.body.items[0].poster, {name: null, avatarUrl: null, key: keyFor(USER)});
+        assert.deepEqual(odd.body.items[1].poster, {name: null, avatarUrl: null, key: keyFor(OTHER_USER)});
     });
 
     test("pool items get refreshed display URLs like the listing", async () => {
@@ -629,9 +727,9 @@ describe("leaderboards", () => {
         assert.deepEqual(res.body, {
             board: "users-by-submissions", category: "all", coverage: null,
             entries: [
-                {rank: 1, poster: {name: "Me", avatarUrl: "https://cdn.discordapp.com/a.png"}, mine: true, score: 5},
-                {rank: 2, poster: {name: "Other", avatarUrl: null}, mine: false, score: 2},
-                {rank: 3, poster: {name: null, avatarUrl: null}, mine: false, score: 1}
+                {rank: 1, poster: {name: "Me", avatarUrl: "https://cdn.discordapp.com/a.png", key: keyFor(USER)}, mine: true, score: 5},
+                {rank: 2, poster: {name: "Other", avatarUrl: null, key: keyFor(OTHER_USER)}, mine: false, score: 2},
+                {rank: 3, poster: {name: null, avatarUrl: null, key: keyFor(MOD_USER)}, mine: false, score: 1}
             ]
         });
         assert.ok(!JSON.stringify(res.body).includes(USER) && !JSON.stringify(res.body).includes(OTHER_USER) && !JSON.stringify(res.body).includes(MOD_USER));
@@ -678,9 +776,9 @@ describe("leaderboards", () => {
             displayUrl: `${a[0].url.split("?")[0]}?ex=${h.discord.refreshedExpiry.toString(16)}&is=1&hm=abc&`,
             createdAt: "2024-05-01T10:00:00Z", source: "discord",
             messageUrl: `https://discord.com/channels/${GUILD}/${HOMIES_CHANNEL}/400000000000000001`,
-            poster: {name: null, avatarUrl: null}, mine: true, canDelete: true
+            poster: {name: null, avatarUrl: null, key: keyFor(USER)}, mine: true, canDelete: true
         });
-        assert.deepEqual([res.body.entries[1].item.poster, res.body.entries[1].item.mine, res.body.entries[1].item.canDelete], [{name: "Other", avatarUrl: null}, false, false]);
+        assert.deepEqual([res.body.entries[1].item.poster, res.body.entries[1].item.mine, res.body.entries[1].item.canDelete], [{name: "Other", avatarUrl: null, key: keyFor(OTHER_USER)}, false, false]);
         assert.ok(!JSON.stringify(res.body).includes(USER) && !JSON.stringify(res.body).includes(OTHER_USER));
         // A moderator may remove any of them.
         const asMod = await h.request("GET", board(`userId=${MOD_USER}&board=posts-by-reactions&limit=2`));

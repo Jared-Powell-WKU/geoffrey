@@ -132,6 +132,10 @@ export class FakeDb {
         if((m = /^SELECT COUNT\(\*\) AS total FROM (\w+) WHERE guildId = \? AND messageId = \?$/.exec(sql))) {
             return [{total: BigInt(this.table(m[1]).filter(r => r.guildId === params[0] && r.messageId === params[1]).length)}];
         }
+        // The posters of a guild, for turning a poster key back into a user id.
+        if((m = /^SELECT DISTINCT userId FROM (\w+) WHERE guildId = \? AND userId IS NOT NULL$/.exec(sql))) {
+            return [...new Set(this.table(m[1]).filter(r => r.guildId === params[0] && r.userId !== null).map(r => r.userId))].map(userId => ({userId}));
+        }
         // The leaderboards. Each statement is one table; the API merges them.
         if((m = /^SELECT userId, COUNT\(\*\) AS score FROM (\w+) WHERE guildId = \? AND userId IS NOT NULL GROUP BY userId$/.exec(sql))) {
             const scores = new Map<string, number>();
